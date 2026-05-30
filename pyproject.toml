@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "mindgraph-engine"
+version = "0.1.0"
+description = "LLM-powered knowledge graph with hybrid RAG and MCP server"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.111",
+    "uvicorn[standard]>=0.29",
+    "networkx>=3.2",
+    "python-louvain>=0.16",
+    "python-frontmatter>=1.1",
+    "pyyaml>=6.0",
+    "typer>=0.12",
+    "psycopg[binary]>=3.1",
+    "pgvector>=0.2",
+    "google-generativeai>=0.8",
+    "openai>=1.30",
+]
+
+[project.scripts]
+mindgraph = "mindgraph.cli:app"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
