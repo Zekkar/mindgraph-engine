@@ -20,8 +20,8 @@ def mock_llm():
 @pytest.fixture
 def mock_embedding():
     m = MagicMock()
-    m.embed.return_value = [0.1] * 768
-    m.dimension = 768
+    m.embed.return_value = [0.1] * 1536
+    m.dimension = 1536
     return m
 
 
