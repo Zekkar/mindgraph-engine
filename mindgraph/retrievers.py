@@ -8,9 +8,13 @@ from typing import Any, Protocol
 import psycopg
 from pgvector.psycopg import register_vector
 
+from mindgraph.store import model_version as _model_version
+
 logger = logging.getLogger("mindgraph.retrievers")
 
-DEFAULT_MODEL_VERSION = "gemini-embedding-001-d768"
+# Derive from the single source of truth so the reader default can never drift
+# from the writer format used by `embed` / build_smart_search.
+DEFAULT_MODEL_VERSION = _model_version("gemini", "gemini-embedding-001", 768)
 
 
 @dataclass(slots=True)
@@ -73,18 +77,21 @@ class VectorRetriever:
         if self._embedding_provider is not None:
             return self._embedding_provider.embed(query)
         import os
-        import google.generativeai as genai
+        from google import genai
+        from google.genai import types
         api_key = os.environ.get("GEMINI_API_KEY", "")
         if not api_key:
             raise RuntimeError("GEMINI_API_KEY not set and no embedding_provider supplied")
-        genai.configure(api_key=api_key)
-        resp = genai.embed_content(
-            model="models/gemini-embedding-001",
-            content=query,
-            task_type="retrieval_query",
-            output_dimensionality=768,
+        client = genai.Client(api_key=api_key)
+        resp = client.models.embed_content(
+            model="gemini-embedding-001",
+            contents=query,
+            config=types.EmbedContentConfig(
+                task_type="RETRIEVAL_QUERY",
+                output_dimensionality=768,
+            ),
         )
-        return resp["embedding"]
+        return list(resp.embeddings[0].values)
 
     def retrieve(self, query: str, top_k: int) -> list[ScoredDoc]:
         try:
@@ -125,10 +132,11 @@ def two_stage_hybrid(
     query: str,
     top_k: int,
     keyword_ret: KeywordRetriever,
-    vector_ret: VectorRetriever,
+    vector_ret: VectorRetriever | None,
     graph_engine,
     weights: dict | None = None,
     min_score: float = 0.15,
+    boost_fn=None,
 ) -> dict:
     t0 = time.time()
     weights = weights or {"keyword": 0.4, "vector": 0.6}
@@ -143,13 +151,18 @@ def two_stage_hybrid(
         logger.warning("keyword failed: %s", e)
         kw_docs = []
 
-    try:
-        vec_docs = vector_ret.retrieve(query, over_k)
-        retrievers_run.append("vector")
-    except Exception as e:
-        logger.warning("vector failed: %s", e)
+    if vector_ret is None:
+        # explicit degraded path: no vector retriever wired (no DB/keys)
         vec_docs = []
         degradation = "vector_unavailable_fallback_to_keyword"
+    else:
+        try:
+            vec_docs = vector_ret.retrieve(query, over_k)
+            retrievers_run.append("vector")
+        except Exception as e:
+            logger.warning("vector failed: %s", e)
+            vec_docs = []
+            degradation = "vector_unavailable_fallback_to_keyword"
 
     pool: dict[str, ScoredDoc] = {}
     kw_max = max((d.score for d in kw_docs), default=1.0) or 1.0
@@ -193,6 +206,17 @@ def two_stage_hybrid(
                 doc.score += 0.1
                 doc.retriever_breakdown["graph_boost"] = 0.1
                 doc.retriever_breakdown["cooccur_neighbors"] = list(cooccur)[:3]
+
+    # intent-driven re-scoring (e.g. boost failure-mode pages) before final ranking
+    if boost_fn is not None:
+        for doc in pool.values():
+            try:
+                factor = boost_fn(doc)
+            except Exception:
+                factor = 1.0
+            if factor and factor != 1.0:
+                doc.score *= factor
+                doc.retriever_breakdown["intent_boost"] = round(factor, 3)
 
     final = sorted(pool.values(), key=lambda x: x.score, reverse=True)
     above_threshold = [d for d in final if d.score >= min_score][:top_k]

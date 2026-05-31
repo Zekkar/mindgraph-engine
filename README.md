@@ -152,11 +152,13 @@ mindgraph search "your query"
 | Command | Description |
 |---------|-------------|
 | `mindgraph ingest` | Run adapters, LLM-rewrite raw/ into wiki/ |
-| `mindgraph embed` | Embed wiki/ sections into pgvector |
+| `mindgraph embed` | Embed wiki/ sections into pgvector (idempotent; `--prune` sweeps orphans) |
 | `mindgraph stats` | Show graph stats (pages, edges, communities) |
-| `mindgraph search QUERY` | TF-IDF keyword search |
+| `mindgraph search QUERY` | TF-IDF keyword search; `--hybrid` for intent-aware graph+vector |
 | `mindgraph check` | Verify wiki/ integrity; exits 1 if empty |
 | `mindgraph coverage CODEBASE` | Measure how many code modules are covered by wiki knowledge |
+| `mindgraph serve` | Run the REST API (FastAPI); binds `127.0.0.1` by default |
+| `mindgraph mcp` | Run the MCP server (stdio) for Claude Code |
 
 All commands accept `--config PATH` (default: `mindgraph.yml`) and `--base-dir PATH` (default: `.`).
 
@@ -206,6 +208,31 @@ mindgraph coverage ./src --json | jq '.coverage_pct'
 ```
 
 This implements the principle: **knowledge coverage = whether code modules are referenced in first-layer wiki knowledge**, not the volume of wiki pages.
+
+---
+
+## Server: REST API + MCP
+
+```bash
+mindgraph serve          # REST API (FastAPI) — binds 127.0.0.1 by default
+mindgraph mcp            # MCP server over stdio (for Claude Code)
+```
+
+The REST API exposes the graph + hybrid search over HTTP:
+
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /health` | liveness + page count |
+| `GET /api/search?q=` | TF-IDF keyword search |
+| `GET /api/smart_search?q=` | intent-aware graph+vector hybrid (degrades to keyword if no DB/keys) |
+| `GET /api/concept/{name}` | full page + metadata + neighbors |
+| `GET /api/concept/{name}/sections` · `/section/{id}` | section navigation |
+| `GET /api/related/{name}?depth=` | graph traversal |
+| `GET /api/communities` · `/api/god-nodes` · `/api/stats` · `/api/path` | graph analytics |
+
+The MCP server registers 7 tools (`search`, `smart_search`, `get_concept`, `related`, `communities`, `stats`, `god_nodes`) so an MCP client like Claude Code can query the knowledge base as external memory.
+
+> ⚠️ **Security**: the API has **no authentication** and serves the entire knowledge base read-only. `serve` binds `127.0.0.1` by default and the Docker compose publishes the port on host loopback only. Use `--host 0.0.0.0` — behind an auth proxy — only when you deliberately want network exposure. `cors_origins` defaults to `[]`; never set `"*"` without an auth layer.
 
 ---
 
@@ -324,38 +351,43 @@ Set env via `.env` file (see `.env.example`).
 
 ```bash
 pip install -e .
-pytest tests/ -v        # 19 tests
+pytest tests/ -v        # 62 tests
 ```
 
 | Test file | Covers |
 |-----------|--------|
 | `test_config.py` | YAML parsing, defaults, intent patterns |
-| `test_providers.py` | ABC enforcement, Gemini/OpenAI mock calls |
+| `test_providers.py` | ABC enforcement, Gemini/OpenAI/Anthropic mocks, factory dispatch |
 | `test_adapters.py` | FileSystemAdapter, empty dirs |
 | `test_graph.py` | Build, TF-IDF search, concept lookup |
 | `test_ingest.py` | Pipeline write, idempotency |
+| `test_search.py` | SmartSearchService: intent routing, degradation, failure boost, Pass-2 expansion |
+| `test_retrievers.py` | keyword normalization, graph boost_fn, vector degradation, embed_query |
+| `test_store.py` | section chunking, content hash, model_version format, build_dsn |
+| `test_server.py` | REST endpoints (TestClient) + MCP tool registration |
+| `test_cli.py` | serve / mcp / search --hybrid / embed idempotency via CliRunner |
 
 ---
 
 ## Roadmap
 
-### Phase 1 — MVP (v0.1.0, current)
-- [x] CLI: ingest / embed / stats / search / check
+### Phase 1 — MVP ✅ (v0.1.0)
+- [x] CLI: ingest / embed / stats / search / check / coverage
 - [x] Provider abstraction (Gemini, OpenAI, Anthropic)
 - [x] FileSystemAdapter + custom adapter protocol
 - [x] WikiGraphEngine (NetworkX + TF-IDF + Louvain)
 - [x] EmbeddingStore (pgvector, ensure_schema, mark-and-sweep)
 - [x] Idempotent ingest with atomic state file
 
-### Phase 2 — Server
-- [ ] REST API (`mindgraph serve`)
-- [ ] MCP server for Claude Code integration
-- [ ] Migrate `google.generativeai` → `google.genai`
+### Phase 2 — Server ✅ (v0.2.0)
+- [x] REST API (`mindgraph serve`) — 10 endpoints, localhost-bound by default
+- [x] MCP server for Claude Code integration (`mindgraph mcp`, 7 tools)
+- [x] Migrate `google.generativeai` → `google.genai`
 - [ ] `mindgraph check` extended diagnostics
 
-### Phase 3 — Scale
-- [ ] Hybrid retrieval endpoint (`two_stage_hybrid` via REST)
-- [ ] IntentRouter wired to search
+### Phase 3 — Scale (v0.2.0, partial)
+- [x] Hybrid retrieval (`two_stage_hybrid`) wired into `search --hybrid` + REST/MCP `smart_search`
+- [x] IntentRouter wired to search (Pass 1 regex classify + Pass 2 LLM expansion)
 - [ ] Incremental graph rebuild (file-diff based)
 - [ ] Concept evolution timeline (devdiary integration)
 

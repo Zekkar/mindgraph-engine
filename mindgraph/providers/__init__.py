@@ -18,7 +18,10 @@ def get_llm_provider(config: MindGraphConfig) -> LLMProvider:
     if p == "openai":
         from mindgraph.providers.openai import OpenAILLMProvider
         return OpenAILLMProvider(api_key=key, model=config.llm.model)
-    raise ValueError(f"Unsupported LLM provider: '{p}'. Supported: gemini, openai")
+    if p == "anthropic":
+        from mindgraph.providers.anthropic import AnthropicLLMProvider
+        return AnthropicLLMProvider(api_key=key, model=config.llm.model)
+    raise ValueError(f"Unsupported LLM provider: '{p}'. Supported: gemini, openai, anthropic")
 
 
 def get_embedding_provider(config: MindGraphConfig) -> EmbeddingProvider:

@@ -22,7 +22,7 @@ def test_config_defaults(tmp_path):
     )
     cfg = MindGraphConfig.from_yaml(cfg_file)
     assert cfg.server.rest_port == 8401  # default
-    assert cfg.server.cors_origins == ["*"]  # default
+    assert cfg.server.cors_origins == []  # secure default: no CORS unless explicitly opted in
     assert cfg.language == "en"  # default
 
 

@@ -23,7 +23,7 @@ database:
 server:
   rest_port: 8401
   mcp_port: 8400
-  cors_origins: ["*"]
+  cors_origins: []             # [] = no CORS (safe default). Never use "*" without an auth layer.
 
 adapters:
   - type: filesystem

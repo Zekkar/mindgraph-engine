@@ -4,4 +4,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends gcc libpq-dev &
 COPY pyproject.toml .
 RUN pip install -e . --no-cache-dir
 COPY mindgraph/ ./mindgraph/
-CMD ["mindgraph", "serve", "--config", "/data/mindgraph.yml", "--base-dir", "/data"]
+# 0.0.0.0 is required INSIDE the container for the port mapping to work; the
+# compose file binds the published port to host loopback so it is not LAN-exposed.
+CMD ["mindgraph", "serve", "--host", "0.0.0.0", "--config", "/data/mindgraph.yml", "--base-dir", "/data"]

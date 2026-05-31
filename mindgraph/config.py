@@ -31,7 +31,9 @@ class DatabaseConfig:
 class ServerConfig:
     rest_port: int = 8401
     mcp_port: int = 8400
-    cors_origins: list[str] = field(default_factory=lambda: ["*"])
+    # Default to no CORS: a wildcard "*" would let any visited website read the
+    # whole local knowledge base via the browser. Operators opt in explicitly.
+    cors_origins: list[str] = field(default_factory=list)
 
 
 @dataclass

@@ -33,25 +33,39 @@ def test_concrete_embedding_provider():
 
 
 def test_gemini_embedding_calls_api():
-    # patch the genai alias as bound in the gemini module
-    with mock.patch("mindgraph.providers.gemini.genai.embed_content") as m:
-        m.return_value = {"embedding": [0.1] * 768}
+    # new google.genai SDK: patch the Client bound in the gemini module
+    with mock.patch("mindgraph.providers.gemini.genai.Client") as MockClient:
+        inst = MockClient.return_value
+        inst.models.embed_content.return_value.embeddings = [
+            mock.MagicMock(values=[0.1] * 768)
+        ]
         from mindgraph.providers.gemini import GeminiEmbeddingProvider
-        p = GeminiEmbeddingProvider(api_key="fake", model="models/gemini-embedding-001")
+        p = GeminiEmbeddingProvider(api_key="fake", model="gemini-embedding-001")
         result = p.embed("test text")
         assert len(result) == 768
-        m.assert_called_once()
+        inst.models.embed_content.assert_called_once()
 
 
 def test_gemini_llm_calls_api():
-    # patch GenerativeModel as bound in the gemini module
-    with mock.patch("mindgraph.providers.gemini.genai.GenerativeModel") as MockModel:
-        instance = MockModel.return_value
-        instance.generate_content.return_value.text = "generated text"
+    # new google.genai SDK: patch the Client bound in the gemini module
+    with mock.patch("mindgraph.providers.gemini.genai.Client") as MockClient:
+        inst = MockClient.return_value
+        inst.models.generate_content.return_value.text = "generated text"
         from mindgraph.providers.gemini import GeminiLLMProvider
-        p = GeminiLLMProvider(api_key="fake", model="gemini-pro")
-        result = p.complete("prompt")
-        assert result == "generated text"
+        p = GeminiLLMProvider(api_key="fake", model="gemini-2.0-flash")
+        assert p.complete("prompt") == "generated text"
+
+
+def test_anthropic_llm_calls_api():
+    # patch Anthropic as bound (aliased anthropic_lib) in the anthropic module
+    with mock.patch("mindgraph.providers.anthropic.anthropic_lib.Anthropic") as MockClient:
+        inst = MockClient.return_value
+        inst.messages.create.return_value.content = [
+            mock.MagicMock(type="text", text="claude answer")
+        ]
+        from mindgraph.providers.anthropic import AnthropicLLMProvider
+        p = AnthropicLLMProvider(api_key="sk-ant-fake", model="claude-sonnet-4-6")
+        assert p.complete("question") == "claude answer"
 
 
 def test_openai_embedding_calls_api():
@@ -78,3 +92,45 @@ def test_openai_llm_calls_api():
         p = OpenAILLMProvider(api_key="sk-fake", model="gpt-4o-mini")
         result = p.complete("question")
         assert result == "answer"
+
+
+# --- provider factory dispatch ---
+
+def _cfg(llm_provider, llm_key_env, emb_provider="gemini", emb_key_env="GEMINI_API_KEY"):
+    from mindgraph.config import MindGraphConfig, LLMConfig, EmbeddingConfig
+    return MindGraphConfig(
+        domain="t",
+        llm=LLMConfig(llm_provider, "m", llm_key_env),
+        embedding=EmbeddingConfig(emb_provider, "m", emb_key_env),
+    )
+
+
+def test_factory_dispatches_anthropic(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-x")
+    with mock.patch("mindgraph.providers.anthropic.anthropic_lib.Anthropic"):
+        from mindgraph.providers import get_llm_provider
+        from mindgraph.providers.anthropic import AnthropicLLMProvider
+        p = get_llm_provider(_cfg("anthropic", "ANTHROPIC_API_KEY"))
+        assert isinstance(p, AnthropicLLMProvider)
+
+
+def test_factory_missing_key_raises(monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    from mindgraph.providers import get_llm_provider
+    with pytest.raises(EnvironmentError):
+        get_llm_provider(_cfg("openai", "OPENAI_API_KEY"))
+
+
+def test_factory_unsupported_provider(monkeypatch):
+    monkeypatch.setenv("X_KEY", "v")
+    from mindgraph.providers import get_llm_provider
+    with pytest.raises(ValueError):
+        get_llm_provider(_cfg("bogus", "X_KEY"))
+
+
+def test_embedding_factory_rejects_anthropic(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-x")
+    from mindgraph.providers import get_embedding_provider
+    with pytest.raises(ValueError):
+        get_embedding_provider(_cfg("anthropic", "ANTHROPIC_API_KEY",
+                                    emb_provider="anthropic", emb_key_env="ANTHROPIC_API_KEY"))

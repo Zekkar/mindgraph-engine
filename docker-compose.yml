@@ -2,7 +2,9 @@ services:
   mindgraph:
     build: .
     ports:
-      - "${MINDGRAPH_REST_PORT:-8401}:8401"
+      # Bound to host loopback: the API has NO auth and exposes the whole KB.
+      # Change to "0.0.0.0:..." (or drop the prefix) only behind an auth proxy.
+      - "127.0.0.1:${MINDGRAPH_REST_PORT:-8401}:8401"
     volumes:
       - ./:/data
     env_file: .env

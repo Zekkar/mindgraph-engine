@@ -16,6 +16,31 @@ logger = logging.getLogger("mindgraph.store")
 _HEADING_RE = re.compile(r"^(#{2,4})\s+(.+?)\s*$")
 
 
+def model_version(provider: str, model: str, dimension: int) -> str:
+    """產生 embedding 的 model_version 識別字串。
+
+    embed 寫入與 VectorRetriever 查詢必須用同一個 model_version，否則查詢命不中任何向量。
+    格式：{provider}-{model}-d{dimension}，例如 gemini-gemini-embedding-001-d768。
+    """
+    return f"{provider}-{model}-d{dimension}"
+
+
+def build_dsn(db) -> str:
+    """從 DatabaseConfig 安全組出 libpq conninfo。
+
+    用 psycopg 的 make_conninfo 取代 f-string 拼接：密碼含空白/引號/反斜線時不會損壞 DSN，
+    也避免把密碼塞進可能被 log 的字串。密碼從 env var 讀取，缺省則不帶 password 欄位。
+    """
+    import os
+    from psycopg.conninfo import make_conninfo
+
+    pw = os.environ.get(db.password_env, "")
+    params = {"host": db.host, "port": db.port, "dbname": db.name, "user": db.user}
+    if pw:
+        params["password"] = pw
+    return make_conninfo(**params)
+
+
 @dataclass(slots=True)
 class Section:
     concept_name: str
@@ -81,6 +106,7 @@ class EmbeddingStore:
             self.conn.close()
 
     def ensure_schema(self, dimension: int, model_version: str):
+        dimension = int(dimension)  # DDL cannot parameterize vector(dim); keep SQL int-only
         with self.conn.cursor() as cur:
             cur.execute("CREATE SCHEMA IF NOT EXISTS wiki")
             cur.execute(f"""

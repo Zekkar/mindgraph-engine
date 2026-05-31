@@ -35,38 +35,64 @@ def embed(
     config: str = typer.Option("mindgraph.yml"),
     base_dir: str = typer.Option("."),
     dry_run: bool = typer.Option(False, "--dry-run"),
+    prune: bool = typer.Option(
+        False, "--prune",
+        help="Delete orphaned embeddings whose wiki sections no longer exist",
+    ),
 ):
-    """Embed wiki/ sections into pgvector."""
+    """Embed wiki/ sections into pgvector (idempotent: unchanged sections skipped)."""
     from mindgraph.config import MindGraphConfig
     from mindgraph.providers import get_embedding_provider
-    from mindgraph.store import EmbeddingStore, iter_sections
+    from mindgraph.store import EmbeddingStore, iter_sections, model_version, build_dsn
     from datetime import datetime, timezone
 
     cfg = MindGraphConfig.from_yaml(config)
     base = Path(base_dir)
-    emb = get_embedding_provider(cfg)
-    db = cfg.database
-    pw = os.environ.get(db.password_env, "")
-    dsn = f"host={db.host} port={db.port} dbname={db.name} user={db.user}" + (
-        f" password={pw}" if pw else ""
-    )
-    model_ver = f"{cfg.embedding.provider}-{cfg.embedding.model}"
 
+    # dry-run only previews which sections would be embedded — no provider/key needed
+    if dry_run:
+        n = 0
+        for section in iter_sections(base / "wiki"):
+            typer.echo(f"DRY: {section.concept_name}#{section.section_id}")
+            n += 1
+        typer.echo(f"Embed dry-run: {n} sections")
+        return
+
+    emb = get_embedding_provider(cfg)
+    model_ver = model_version(cfg.embedding.provider, cfg.embedding.model, emb.dimension)
+    dsn = build_dsn(cfg.database)
+
+    embedded = skipped = 0
     with EmbeddingStore(dsn) as store:
         store.ensure_schema(emb.dimension, model_ver)
         ingest_ts = datetime.now(timezone.utc)
-        count = 0
         for section in iter_sections(base / "wiki"):
-            if dry_run:
-                typer.echo(f"DRY: {section.concept_name}#{section.section_id}")
+            existing = store.get_existing_hash(
+                section.concept_name, section.section_id, model_ver
+            )
+            if existing == section.content_hash:
+                store.touch(section.concept_name, section.section_id, model_ver, ingest_ts)
+                skipped += 1
             else:
                 store.upsert(section, emb.embed(section.chunk_text), model_ver, ingest_ts)
-            count += 1
-            if count % 20 == 0 and not dry_run:
+                embedded += 1
+            if (embedded + skipped) % 20 == 0:
                 store.commit()
-        if not dry_run:
-            store.commit()
-    typer.echo(f"Embed complete: {count} sections")
+        store.commit()
+        orphans = 0
+        if prune:
+            if embedded + skipped == 0:
+                # guard: 0 sections would make EVERY stored embedding an "orphan"
+                typer.echo(
+                    "WARNING: 0 sections found in wiki/ — refusing to --prune (would delete "
+                    "ALL embeddings for this model). Check the wiki path / config.",
+                    err=True,
+                )
+            else:
+                orphans = store.mark_sweep_orphans(model_ver, ingest_ts)
+                store.commit()
+    msg = f"Embed complete: {embedded} embedded, {skipped} skipped"
+    typer.echo(msg + (f", {orphans} orphans pruned" if prune else ""))
 
 
 @app.command()
@@ -91,8 +117,16 @@ def search(
     config: str = typer.Option("mindgraph.yml"),
     base_dir: str = typer.Option("."),
     limit: int = typer.Option(10),
+    hybrid: bool = typer.Option(
+        False, "--hybrid",
+        help="Intent-aware graph+vector hybrid retrieval (degrades to keyword if no DB/keys)",
+    ),
 ):
-    """Quick keyword search."""
+    """Search the knowledge graph.
+
+    Default: TF-IDF keyword search (no external deps).
+    --hybrid: intent-aware graph + pgvector hybrid retrieval via SmartSearchService.
+    """
     import json
     from mindgraph.config import MindGraphConfig
     from mindgraph.graph import WikiGraphEngine
@@ -100,7 +134,15 @@ def search(
     cfg = MindGraphConfig.from_yaml(config)
     engine = WikiGraphEngine(str(Path(base_dir) / "wiki"))
     engine.build()
-    typer.echo(json.dumps(engine.search(query, limit), ensure_ascii=False, indent=2))
+
+    if not hybrid:
+        typer.echo(json.dumps(engine.search(query, limit), ensure_ascii=False, indent=2))
+        return
+
+    from mindgraph.search import build_smart_search
+
+    svc = build_smart_search(engine, cfg)
+    typer.echo(json.dumps(svc.search(query, limit), ensure_ascii=False, indent=2))
 
 
 @app.command()
@@ -227,6 +269,50 @@ def coverage(
                 typer.echo(f"  ✗ {u['module']}")
         else:
             typer.echo("\nAll modules covered!")
+
+
+@app.command()
+def serve(
+    config: str = typer.Option("mindgraph.yml"),
+    base_dir: str = typer.Option("."),
+    host: str = typer.Option(
+        "127.0.0.1", help="Bind address; use 0.0.0.0 to expose on LAN (NO AUTH!)"
+    ),
+    port: int = typer.Option(0, help="Override server.rest_port from config"),
+):
+    """Run the REST API server (FastAPI + uvicorn).
+
+    The API has NO authentication and exposes the entire knowledge base read-only.
+    Default binds to localhost; binding 0.0.0.0 exposes it to the whole network —
+    put it behind a reverse proxy / auth layer first.
+    """
+    import uvicorn
+    from mindgraph.config import MindGraphConfig
+    from mindgraph.server.rest import build_app
+
+    cfg = MindGraphConfig.from_yaml(config)
+    application = build_app(base_dir=base_dir, config_path=config)
+    bind_port = port or cfg.server.rest_port
+    if host == "0.0.0.0":
+        typer.echo(
+            "WARNING: 0.0.0.0 exposes the UNAUTHENTICATED knowledge base to the whole "
+            "network. Use --host 127.0.0.1 or front it with an auth proxy.",
+            err=True,
+        )
+    typer.echo(f"MindGraph REST API on http://{host}:{bind_port}")
+    uvicorn.run(application, host=host, port=bind_port)
+
+
+@app.command()
+def mcp(
+    config: str = typer.Option("mindgraph.yml"),
+    base_dir: str = typer.Option("."),
+):
+    """Run the MCP server over stdio (for Claude Code integration)."""
+    from mindgraph.server.mcp_server import build_mcp
+
+    server = build_mcp(base_dir=base_dir, config_path=config)
+    server.run(transport="stdio")
 
 
 if __name__ == "__main__":
