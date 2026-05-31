@@ -1,0 +1,31 @@
+# MindGraph Configuration — replace all values with your domain settings
+
+domain: "my-knowledge-base"
+language: "en"
+
+llm:
+  provider: anthropic          # openai | gemini | anthropic
+  model: claude-sonnet-4-6
+  api_key_env: ANTHROPIC_API_KEY
+
+embedding:
+  provider: gemini             # openai | gemini
+  model: gemini-embedding-001
+  api_key_env: GEMINI_API_KEY
+
+database:
+  host: postgres               # Docker service name; use localhost for local dev
+  port: 5432
+  name: mindgraph
+  user: mindgraph
+  password_env: MINDGRAPH_DB_PASSWORD
+
+server:
+  rest_port: 8401
+  mcp_port: 8400
+  cors_origins: ["*"]
+
+adapters:
+  - type: filesystem
+    source: ./raw/notes
+    target: raw/notes

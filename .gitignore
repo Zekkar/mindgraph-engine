@@ -5,3 +5,6 @@ dist/
 build/
 .env
 *.tmp
+wiki/
+.ingest-state.json
+.pytest_cache/
