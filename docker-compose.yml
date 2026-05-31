@@ -16,7 +16,7 @@ services:
     environment:
       POSTGRES_DB: ${MINDGRAPH_DB_NAME:-mindgraph}
       POSTGRES_USER: ${MINDGRAPH_DB_USER:-mindgraph}
-      POSTGRES_PASSWORD: ${MINDGRAPH_DB_PASSWORD:-changeme}
+      POSTGRES_PASSWORD: ${MINDGRAPH_DB_PASSWORD:?set MINDGRAPH_DB_PASSWORD in .env}
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
