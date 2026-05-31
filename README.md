@@ -156,6 +156,7 @@ mindgraph search "your query"
 | `mindgraph stats` | Show graph stats (pages, edges, communities) |
 | `mindgraph search QUERY` | TF-IDF keyword search |
 | `mindgraph check` | Verify wiki/ integrity; exits 1 if empty |
+| `mindgraph coverage CODEBASE` | Measure how many code modules are covered by wiki knowledge |
 
 All commands accept `--config PATH` (default: `mindgraph.yml`) and `--base-dir PATH` (default: `.`).
 
@@ -174,6 +175,37 @@ Second run: unchanged files → `skipped` counter goes up, zero API calls made.
 ### Embed
 
 Splits each wiki page at H2/H3/H4 headings into `Section` chunks, embeds each chunk, upserts into `wiki.embeddings` with `UNIQUE(concept_name, section_id, model_version)`.
+
+### Coverage
+
+```bash
+mindgraph coverage CODEBASE [--base-dir .] [--min-mentions 1] [--service-level] [--json]
+```
+
+Scans CODEBASE for `.py` files and reports which are referenced in `wiki/` pages.
+
+**Coverage = modules with >= min-mentions wiki references / total modules scanned**
+
+Options:
+- `--service-level` — scan top-level directories as service units (not individual files)
+- `--min-mentions N` — threshold for "covered" (default: 1)
+- `--exclude` — comma-separated stems to skip (default: `__init__,test,conftest,migration,setup,manage`)
+- `--json` — machine-readable output for CI pipelines
+
+Examples:
+
+```bash
+# File-level scan
+mindgraph coverage ./IBAPI/backend --base-dir .
+
+# Service-level scan of ShioajiPy microservices
+mindgraph coverage ./ShioajiPy --service-level --base-dir .
+
+# CI gate
+mindgraph coverage ./src --json | jq '.coverage_pct'
+```
+
+This implements the principle: **knowledge coverage = whether code modules are referenced in first-layer wiki knowledge**, not the volume of wiki pages.
 
 ---
 

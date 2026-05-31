@@ -121,5 +121,113 @@ def check(
     typer.echo(f"OK: {s['total_pages']} pages, {s['total_edges']} edges")
 
 
+@app.command()
+def coverage(
+    codebase: str = typer.Argument(..., help="Path to codebase root to scan"),
+    base_dir: str = typer.Option(".", help="MindGraph knowledge base root (contains wiki/)"),
+    min_mentions: int = typer.Option(1, help="Min wiki mentions to count as covered"),
+    exclude: str = typer.Option(
+        "__init__,test,conftest,migration,setup,manage",
+        help="Comma-separated stems to exclude",
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
+    service_level: bool = typer.Option(
+        False, "--service-level",
+        help="Scan top-level directories as service units instead of individual files",
+    ),
+):
+    """Measure how many codebase modules are covered by wiki knowledge.
+
+    Coverage = modules with at least --min-mentions wiki page references
+             / total modules scanned.
+
+    Example:
+        mindgraph coverage ./IBAPI/backend --base-dir .
+        mindgraph coverage ./ShioajiPy --service-level --base-dir .
+    """
+    import json as json_mod
+    import re
+
+    wiki_root = Path(base_dir) / "wiki"
+    code_root = Path(codebase)
+
+    if not code_root.exists():
+        typer.echo(f"ERROR: codebase path not found: {code_root}", err=True)
+        raise typer.Exit(1)
+    if not wiki_root.exists():
+        typer.echo(f"ERROR: wiki/ not found at {wiki_root}", err=True)
+        raise typer.Exit(1)
+
+    exclude_stems = {s.strip() for s in exclude.split(",")}
+
+    # ── Collect wiki text corpus ──
+    wiki_corpus = ""
+    for md in wiki_root.rglob("*.md"):
+        try:
+            wiki_corpus += md.read_text(encoding="utf-8", errors="ignore") + "\n"
+        except Exception:
+            pass
+
+    # ── Collect modules to scan ──
+    if service_level:
+        # Top-level directories as service units
+        modules = [
+            (d.name, d.name)
+            for d in sorted(code_root.iterdir())
+            if d.is_dir() and not d.name.startswith((".", "_", "__"))
+        ]
+    else:
+        # Individual .py files
+        modules = []
+        for py in sorted(code_root.rglob("*.py")):
+            if "__pycache__" in str(py) or "__pycache__" in py.parts:
+                continue
+            stem = py.stem
+            if stem in exclude_stems:
+                continue
+            rel = str(py.relative_to(code_root))
+            modules.append((stem, rel))
+
+    # ── Score each module ──
+    covered = []
+    uncovered = []
+    for stem, label in modules:
+        pattern = re.compile(re.escape(stem), re.IGNORECASE)
+        count = len(pattern.findall(wiki_corpus))
+        entry = {"module": label, "stem": stem, "mentions": count}
+        if count >= min_mentions:
+            covered.append(entry)
+        else:
+            uncovered.append(entry)
+
+    total = len(modules)
+    cov_pct = round(len(covered) / total * 100, 1) if total else 0.0
+
+    result = {
+        "codebase": str(code_root),
+        "wiki": str(wiki_root),
+        "total_modules": total,
+        "covered": len(covered),
+        "uncovered": len(uncovered),
+        "coverage_pct": cov_pct,
+        "min_mentions": min_mentions,
+        "uncovered_modules": [u["module"] for u in uncovered],
+        "covered_modules": [c["module"] for c in covered],
+    }
+
+    if json_output:
+        typer.echo(json_mod.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        typer.echo(f"Coverage: {len(covered)}/{total} ({cov_pct}%)")
+        typer.echo(f"Wiki: {wiki_root}")
+        typer.echo(f"Codebase: {code_root}")
+        if uncovered:
+            typer.echo(f"\nUncovered ({len(uncovered)}):")
+            for u in sorted(uncovered, key=lambda x: x["module"]):
+                typer.echo(f"  ✗ {u['module']}")
+        else:
+            typer.echo("\nAll modules covered!")
+
+
 if __name__ == "__main__":
     app()
