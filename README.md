@@ -155,8 +155,9 @@ mindgraph search "your query"
 | `mindgraph embed` | Embed wiki/ sections into pgvector (idempotent; `--prune` sweeps orphans) |
 | `mindgraph stats` | Show graph stats (pages, edges, communities) |
 | `mindgraph search QUERY` | TF-IDF keyword search; `--hybrid` for intent-aware graph+vector |
-| `mindgraph check` | Verify wiki/ integrity; exits 1 if empty |
+| `mindgraph check` | wiki/ integrity + diagnostics (orphans, broken links, missing frontmatter); `--strict` exits 1 on broken links |
 | `mindgraph coverage CODEBASE` | Measure how many code modules are covered by wiki knowledge |
+| `mindgraph timeline CONCEPT` | How a concept evolved over time across raw/ dated notes |
 | `mindgraph serve` | Run the REST API (FastAPI); binds `127.0.0.1` by default |
 | `mindgraph mcp` | Run the MCP server (stdio) for Claude Code |
 
@@ -229,8 +230,9 @@ The REST API exposes the graph + hybrid search over HTTP:
 | `GET /api/concept/{name}/sections` · `/section/{id}` | section navigation |
 | `GET /api/related/{name}?depth=` | graph traversal |
 | `GET /api/communities` · `/api/god-nodes` · `/api/stats` · `/api/path` | graph analytics |
+| `GET /api/timeline/{concept}` | chronological mentions of a concept across raw/ notes |
 
-The MCP server registers 7 tools (`search`, `smart_search`, `get_concept`, `related`, `communities`, `stats`, `god_nodes`) so an MCP client like Claude Code can query the knowledge base as external memory.
+The MCP server registers 8 tools (`search`, `smart_search`, `get_concept`, `related`, `communities`, `stats`, `god_nodes`, `timeline`) so an MCP client like Claude Code can query the knowledge base as external memory.
 
 > ⚠️ **Security**: the API has **no authentication** and serves the entire knowledge base read-only. `serve` binds `127.0.0.1` by default and the Docker compose publishes the port on host loopback only. Use `--host 0.0.0.0` — behind an auth proxy — only when you deliberately want network exposure. `cors_origins` defaults to `[]`; never set `"*"` without an auth layer.
 
@@ -351,7 +353,7 @@ Set env via `.env` file (see `.env.example`).
 
 ```bash
 pip install -e .
-pytest tests/ -v        # 62 tests
+pytest tests/ -v        # 72 tests
 ```
 
 | Test file | Covers |
@@ -359,13 +361,14 @@ pytest tests/ -v        # 62 tests
 | `test_config.py` | YAML parsing, defaults, intent patterns |
 | `test_providers.py` | ABC enforcement, Gemini/OpenAI/Anthropic mocks, factory dispatch |
 | `test_adapters.py` | FileSystemAdapter, empty dirs |
-| `test_graph.py` | Build, TF-IDF search, concept lookup |
+| `test_graph.py` | build, TF-IDF search, concept lookup, incremental rebuild, diagnostics |
 | `test_ingest.py` | Pipeline write, idempotency |
 | `test_search.py` | SmartSearchService: intent routing, degradation, failure boost, Pass-2 expansion |
 | `test_retrievers.py` | keyword normalization, graph boost_fn, vector degradation, embed_query |
 | `test_store.py` | section chunking, content hash, model_version format, build_dsn |
 | `test_server.py` | REST endpoints (TestClient) + MCP tool registration |
-| `test_cli.py` | serve / mcp / search --hybrid / embed idempotency via CliRunner |
+| `test_cli.py` | serve / mcp / search --hybrid / embed idempotency / timeline / check via CliRunner |
+| `test_timeline.py` | concept timeline: date resolution, chronological ordering, snippets |
 
 ---
 
@@ -383,13 +386,13 @@ pytest tests/ -v        # 62 tests
 - [x] REST API (`mindgraph serve`) — 10 endpoints, localhost-bound by default
 - [x] MCP server for Claude Code integration (`mindgraph mcp`, 7 tools)
 - [x] Migrate `google.generativeai` → `google.genai`
-- [ ] `mindgraph check` extended diagnostics
+- [x] `mindgraph check` extended diagnostics (orphans, broken wikilinks, missing frontmatter, `--strict`)
 
-### Phase 3 — Scale (v0.2.0, partial)
+### Phase 3 — Scale ✅ (v0.2.0)
 - [x] Hybrid retrieval (`two_stage_hybrid`) wired into `search --hybrid` + REST/MCP `smart_search`
 - [x] IntentRouter wired to search (Pass 1 regex classify + Pass 2 LLM expansion)
-- [ ] Incremental graph rebuild (file-diff based)
-- [ ] Concept evolution timeline (devdiary integration)
+- [x] Incremental graph rebuild (mtime file-diff: re-parse only changed files)
+- [x] Concept evolution timeline (`mindgraph timeline` + `/api/timeline`, devdiary-aware)
 
 ---
 

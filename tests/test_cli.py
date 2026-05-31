@@ -130,3 +130,30 @@ def test_embed_idempotency_skips_unchanged(tmp_path, monkeypatch):
     assert r2.exit_code == 0
     assert _FakeStore.upserts == first   # nothing re-embedded
     assert _FakeStore.touches >= 1       # unchanged section touched instead
+
+
+def test_timeline_command(tmp_path):
+    base, _cfg = _setup(tmp_path)
+    raw = tmp_path / "raw" / "devdiary"
+    raw.mkdir(parents=True)
+    (raw / "2026-02-02.md").write_text("# d\n\nnote about alpha caching\n", encoding="utf-8")
+    r = runner.invoke(cli.app, ["timeline", "alpha", "--base-dir", base])
+    assert r.exit_code == 0
+    assert "2026-02-02" in r.stdout
+    assert "mentions" in r.stdout
+
+
+def test_check_reports_diagnostics(tmp_path):
+    base, _cfg = _setup(tmp_path)
+    (tmp_path / "wiki" / "b.md").write_text("# B\n\n[[ghost]] missing link\n", encoding="utf-8")
+    r = runner.invoke(cli.app, ["check", "--base-dir", base])
+    assert r.exit_code == 0
+    assert "diagnostics" in r.stdout
+    assert "broken links" in r.stdout
+
+
+def test_check_strict_fails_on_broken_links(tmp_path):
+    base, _cfg = _setup(tmp_path)
+    (tmp_path / "wiki" / "b.md").write_text("# B\n\n[[ghost]] missing link\n", encoding="utf-8")
+    r = runner.invoke(cli.app, ["check", "--strict", "--base-dir", base])
+    assert r.exit_code == 1

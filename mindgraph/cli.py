@@ -148,19 +148,42 @@ def search(
 @app.command()
 def check(
     base_dir: str = typer.Option("."),
+    strict: bool = typer.Option(False, "--strict", help="Exit 1 if broken wikilinks exist"),
 ):
-    """Verify wiki/ integrity: parse all pages and report errors."""
+    """Verify wiki/ integrity: stats + diagnostics (orphans, broken wikilinks, missing frontmatter)."""
     import json
     from mindgraph.graph import WikiGraphEngine
 
     engine = WikiGraphEngine(str(Path(base_dir) / "wiki"))
     engine.build()
     s = engine.get_stats()
-    typer.echo(json.dumps(s, ensure_ascii=False, indent=2))
+    diag = engine.get_diagnostics()
+    typer.echo(json.dumps({"stats": s, "diagnostics": diag}, ensure_ascii=False, indent=2))
     if s["total_pages"] == 0:
         typer.echo("WARNING: no wiki pages found", err=True)
         raise typer.Exit(1)
-    typer.echo(f"OK: {s['total_pages']} pages, {s['total_edges']} edges")
+    typer.echo(
+        f"OK: {s['total_pages']} pages, {s['total_edges']} edges | "
+        f"{diag['orphan_count']} orphans, {diag['broken_count']} broken links, "
+        f"{diag['no_frontmatter_count']} no-frontmatter"
+    )
+    if strict and diag["broken_count"] > 0:
+        typer.echo(f"STRICT FAIL: {diag['broken_count']} broken wikilinks", err=True)
+        raise typer.Exit(1)
+
+
+@app.command()
+def timeline(
+    concept: str = typer.Argument(...),
+    base_dir: str = typer.Option("."),
+    limit: int = typer.Option(50),
+):
+    """Show how a concept evolved over time across raw/ dated notes (devdiary, logs...)."""
+    import json
+    from mindgraph.timeline import concept_timeline
+
+    result = concept_timeline(Path(base_dir) / "raw", concept, limit=limit)
+    typer.echo(json.dumps(result, ensure_ascii=False, indent=2))
 
 
 @app.command()

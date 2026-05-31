@@ -76,6 +76,11 @@ def create_app(engine, smart_service=None, cors_origins: list[str] | None = None
     def path(source: str = Query(...), target: str = Query(...)):
         return engine.shortest_path(source, target)
 
+    @app.get("/api/timeline/{concept}")
+    def timeline(concept: str, limit: int = 50):
+        from mindgraph.timeline import concept_timeline
+        return concept_timeline(engine.wiki_root.parent / "raw", concept, limit=limit)
+
     return app
 
 

@@ -44,31 +44,58 @@ class WikiGraphEngine:
     def needs_rebuild(self) -> bool:
         if not self._last_build:
             return True
-        for path in self.wiki_root.rglob("*.md"):
-            mtime = path.stat().st_mtime
-            if str(path) not in self._file_mtimes or self._file_mtimes[str(path)] != mtime:
-                return True
-        return False
+        current = {str(p): p.stat().st_mtime for p in self.wiki_root.rglob("*.md")}
+        if set(current) != set(self._file_mtimes):
+            return True  # a file was added or deleted
+        return any(self._file_mtimes.get(k) != mt for k, mt in current.items())
+
+    def build_incremental(self):
+        """只重新解析變動/新增的檔案（依 mtime），移除已刪除頁面，再從 self.pages 重建
+        記憶體圖/索引。避免每次變動都重讀並解析全部 md——檔案多或大時這是 ensure_fresh 的主要成本。"""
+        current = {str(p): p for p in self.wiki_root.rglob("*.md")}
+        for known in [k for k in self._file_mtimes if k not in current]:
+            self.pages.pop(Path(known).stem, None)
+            self._file_mtimes.pop(known, None)
+        changed = 0
+        for path_str, md_path in current.items():
+            mtime = md_path.stat().st_mtime
+            if self._file_mtimes.get(path_str) == mtime:
+                continue
+            try:
+                self.pages[md_path.stem] = self._load_page(md_path)
+                self._file_mtimes[path_str] = mtime
+                changed += 1
+            except Exception as e:
+                logger.warning("skip markdown file", extra={"path": str(md_path), "error": str(e)})
+        self._build_graph()
+        self._detect_communities()
+        self._build_search_index()
+        self._last_build = datetime.now()
+        logger.info("graph incrementally rebuilt", extra={"changed_files": changed})
 
     def ensure_fresh(self):
-        if self.needs_rebuild():
+        if not self._last_build:
             self.build()
+        elif self.needs_rebuild():
+            self.build_incremental()
 
     # === Build Phase ===
+
+    def _load_page(self, md_path) -> dict:
+        post = frontmatter.load(str(md_path))
+        return {
+            'content': post.content,
+            'metadata': dict(post.metadata),
+            'path': str(md_path.relative_to(self.wiki_root.parent)),
+            'category': md_path.parent.name if md_path.parent != self.wiki_root else 'root',
+        }
 
     def _scan_wiki_files(self):
         self.pages = {}
         self._file_mtimes = {}
         for md_path in self.wiki_root.rglob("*.md"):
-            name = md_path.stem
             try:
-                post = frontmatter.load(str(md_path))
-                self.pages[name] = {
-                    'content': post.content,
-                    'metadata': dict(post.metadata),
-                    'path': str(md_path.relative_to(self.wiki_root.parent)),
-                    'category': md_path.parent.name if md_path.parent != self.wiki_root else 'root',
-                }
+                self.pages[md_path.stem] = self._load_page(md_path)
                 self._file_mtimes[str(md_path)] = md_path.stat().st_mtime
             except Exception as e:
                 logger.warning("skip markdown file", extra={"path": str(md_path), "error": str(e)})
@@ -256,6 +283,26 @@ class WikiGraphEngine:
             'density': round(nx.density(self.graph), 4) if self.graph.number_of_nodes() > 1 else 0,
             'categories': dict(Counter(p['category'] for p in self.pages.values())),
             'last_build': self._last_build.isoformat() if self._last_build else None,
+        }
+
+    def get_diagnostics(self) -> dict:
+        """擴充健康診斷（供 `mindgraph check` 用）：孤立頁面（degree 0、無連結）、
+        斷掉的 wikilink（指向不存在的頁）、缺 frontmatter 的頁。檢出 wiki 知識庫的結構問題。"""
+        self.ensure_fresh()
+        orphans = sorted(n for n in self.graph.nodes if self.graph.degree(n) == 0)
+        broken = []
+        for name, page in self.pages.items():
+            for link in re.findall(r'\[\[([^\]|]+?)(?:\|[^\]]+)?\]\]', page['content']):
+                if link not in self.pages:
+                    broken.append({"page": name, "link": link})
+        no_meta = sorted(n for n, p in self.pages.items() if not p['metadata'])
+        return {
+            "orphan_pages": orphans,
+            "orphan_count": len(orphans),
+            "broken_wikilinks": broken[:100],
+            "broken_count": len(broken),
+            "pages_without_frontmatter": no_meta,
+            "no_frontmatter_count": len(no_meta),
         }
 
     def get_god_nodes(self, limit: int = 5) -> list:

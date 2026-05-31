@@ -60,6 +60,12 @@ def create_mcp(engine, smart_service=None) -> FastMCP:
         """Most-connected hub concepts (highest degree)."""
         return engine.get_god_nodes(limit)
 
+    @server.tool()
+    def timeline(concept: str, limit: int = 50) -> dict:
+        """How a concept evolved over time across raw/ dated notes (chronological mentions)."""
+        from mindgraph.timeline import concept_timeline
+        return concept_timeline(engine.wiki_root.parent / "raw", concept, limit=limit)
+
     return server
 
 
