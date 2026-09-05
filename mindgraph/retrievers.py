@@ -164,18 +164,33 @@ def two_stage_hybrid(
             vec_docs = []
             degradation = "vector_unavailable_fallback_to_keyword"
 
+    # Merge by concept_name. NOTE: each retriever's hits are section-level, so a
+    # single concept can appear more than once (multiple sections matched). We
+    # keep only the best-scoring section per concept per retriever — summing
+    # every hit with `+=` would let concepts with many matched sections
+    # out-rank a concept with a single, precisely-matching section, and
+    # unconditionally overwriting chunk_text/section_id on every hit would
+    # leave whichever section was processed last (not necessarily the best)
+    # as the representative content. See trading-wiki devdiary 2026-09-05 /
+    # mindgraph-code-exists-not-wired-adjacent bug: this file was copied from
+    # trading-wiki's mcp-server/retrievers.py before that fix landed there.
     pool: dict[str, ScoredDoc] = {}
+    kw_best: dict[str, float] = {}
+    vec_best: dict[str, float] = {}
+
     kw_max = max((d.score for d in kw_docs), default=1.0) or 1.0
     for rank, d in enumerate(kw_docs, 1):
         key = d.concept_name
+        norm_score = d.score / kw_max
         if key not in pool:
             pool[key] = ScoredDoc(
                 concept_name=d.concept_name, section_id=d.section_id,
                 chunk_text=d.chunk_text, score=0.0, retriever_breakdown={},
             )
-        pool[key].score += weights["keyword"] * (d.score / kw_max)
-        pool[key].retriever_breakdown.update({"keyword_rank": rank,
-                                              "keyword_score": round(d.score, 4)})
+        if norm_score > kw_best.get(key, -1.0):
+            kw_best[key] = norm_score
+            pool[key].retriever_breakdown.update({"keyword_rank": rank,
+                                                  "keyword_score": round(d.score, 4)})
 
     for rank, d in enumerate(vec_docs, 1):
         key = d.concept_name
@@ -184,12 +199,15 @@ def two_stage_hybrid(
                 concept_name=d.concept_name, section_id=d.section_id,
                 chunk_text=d.chunk_text, score=0.0, retriever_breakdown={},
             )
-        else:
+        if d.score > vec_best.get(key, -1.0):
+            vec_best[key] = d.score
             pool[key].section_id = d.section_id
             pool[key].chunk_text = d.chunk_text
-        pool[key].score += weights["vector"] * d.score
-        pool[key].retriever_breakdown.update({"vector_rank": rank,
-                                              "vector_score": round(d.score, 4)})
+            pool[key].retriever_breakdown.update({"vector_rank": rank,
+                                                  "vector_score": round(d.score, 4)})
+
+    for key, doc in pool.items():
+        doc.score = weights["keyword"] * kw_best.get(key, 0.0) + weights["vector"] * vec_best.get(key, 0.0)
 
     stage1_top = sorted(pool.values(), key=lambda x: x.score, reverse=True)[: top_k * 2]
     if graph_engine and hasattr(graph_engine, "get_related"):
