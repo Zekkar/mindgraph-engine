@@ -95,7 +95,7 @@ class _FakeStore:
     def get_existing_hash(self, c, s, m):
         return _FakeStore.store.get((c, s))
 
-    def touch(self, c, s, m, ts):
+    def touch(self, c, s, m, ts, category=None, changed_hint=None):
         _FakeStore.touches += 1
 
     def upsert(self, section, emb, m, ts):
@@ -130,17 +130,6 @@ def test_embed_idempotency_skips_unchanged(tmp_path, monkeypatch):
     assert r2.exit_code == 0
     assert _FakeStore.upserts == first   # nothing re-embedded
     assert _FakeStore.touches >= 1       # unchanged section touched instead
-
-
-def test_timeline_command(tmp_path):
-    base, _cfg = _setup(tmp_path)
-    raw = tmp_path / "raw" / "devdiary"
-    raw.mkdir(parents=True)
-    (raw / "2026-02-02.md").write_text("# d\n\nnote about alpha caching\n", encoding="utf-8")
-    r = runner.invoke(cli.app, ["timeline", "alpha", "--base-dir", base])
-    assert r.exit_code == 0
-    assert "2026-02-02" in r.stdout
-    assert "mentions" in r.stdout
 
 
 def test_check_reports_diagnostics(tmp_path):

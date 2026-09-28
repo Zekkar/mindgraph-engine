@@ -24,10 +24,12 @@ class ScoredDoc:
     chunk_text: str
     score: float
     retriever_breakdown: dict[str, Any] = field(default_factory=dict)
+    category: str | None = None  # wiki 資料夾（知識種類）；hook 靠它挑出失敗模式頁
 
     def to_dict(self) -> dict:
         return {
             "concept_name": self.concept_name,
+            "category": self.category,
             "section_id": self.section_id,
             "chunk_text": self.chunk_text,
             "score": round(self.score, 4),
@@ -72,6 +74,11 @@ class VectorRetriever:
         self.dsn = dsn
         self._embedding_provider = embedding_provider
         self._model_version = model_version
+
+    @property
+    def model_version(self) -> str:
+        """查詢時比對的 embedding model_version（須與 embed 寫入端相同）。"""
+        return self._model_version
 
     def embed_query(self, query: str) -> list[float]:
         if self._embedding_provider is not None:
@@ -137,7 +144,13 @@ def two_stage_hybrid(
     weights: dict | None = None,
     min_score: float = 0.15,
     boost_fn=None,
+    recency=None,
 ) -> dict:
+    """兩階段混合檢索：關鍵字＋向量召回 → 加權合併 → 時間遞減 → 圖共現加分 → 門檻。
+
+    時間遞減（recency，RecencyWeighter）的位置不可移動（不變式 I-4）：
+    放在 retriever 內部會被關鍵字再正規化抵銷；放在圖加分之後，候選挑選就不看新舊。
+    """
     t0 = time.time()
     weights = weights or {"keyword": 0.4, "vector": 0.6}
     over_k = max(top_k * 3, 15)
@@ -209,18 +222,30 @@ def two_stage_hybrid(
     for key, doc in pool.items():
         doc.score = weights["keyword"] * kw_best.get(key, 0.0) + weights["vector"] * vec_best.get(key, 0.0)
 
+    pages = getattr(graph_engine, "pages", None) or {}
+    for doc in pool.values():
+        doc.category = (pages.get(doc.concept_name) or {}).get("category")
+
+    if recency is not None:
+        try:
+            recency.apply(pool.values())
+            retrievers_run.append("recency")
+        except Exception as e:  # 降級：時間遞減失敗不影響檢索
+            logger.warning("recency failed: %s", e)
+
     stage1_top = sorted(pool.values(), key=lambda x: x.score, reverse=True)[: top_k * 2]
-    if graph_engine and hasattr(graph_engine, "get_related"):
+    if graph_engine and hasattr(graph_engine, "neighbors"):
         retrievers_run.append("graph_post")
         top_names = {d.concept_name for d in stage1_top}
         for doc in stage1_top:
             try:
-                rel = graph_engine.get_related(doc.concept_name, depth=1)
-                neighbors = {n.get("name") for n in rel.get("nodes", []) if isinstance(n, dict)}
+                neighbors = graph_engine.neighbors(doc.concept_name)
             except Exception:
                 neighbors = set()
             cooccur = neighbors & top_names
-            if cooccur and len(cooccur) > 1:
+            # 至少 1 個「真正的」鄰居也在候選內就加分。舊版 get_related 把概念自己算進鄰居，
+            # 寫成 len > 1 實際等於 ≥1 個真鄰居；參考實作的線上行為與命中率都建立在這個語意上。
+            if cooccur:
                 doc.score += 0.1
                 doc.retriever_breakdown["graph_boost"] = 0.1
                 doc.retriever_breakdown["cooccur_neighbors"] = list(cooccur)[:3]
@@ -255,9 +280,10 @@ def two_stage_hybrid(
     suggestions = []
     if above_threshold:
         suggestions.append(f"深入查詢：get_concept(\"{above_threshold[0].concept_name}\")")
-        if len(above_threshold) >= 2:
+        if above_threshold[0].section_id:
             suggestions.append(
-                f"對照查詢：related(\"{above_threshold[0].concept_name}\", depth=2)"
+                f"只讀該段：get_section(\"{above_threshold[0].concept_name}\", "
+                f"\"{above_threshold[0].section_id}\")"
             )
 
     return {

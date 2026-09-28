@@ -1,6 +1,9 @@
 """
 Wiki Knowledge Graph Engine
-解析 wiki/ markdown → NetworkX 圖 → 搜尋 + 社群偵測 + Section 導航
+解析 wiki/ markdown → NetworkX 圖 → 關鍵字搜尋 + 圖共現加分 + Section 導航
+
+社群偵測 / god nodes / 最短路徑已於 v0.3.0 移除：實測使用量為 0，
+圖本身只保留給混合檢索的共現加分與 get_concept 的鄰居清單。
 """
 import re
 import math
@@ -13,6 +16,21 @@ from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
+# 共用標籤推測邊：只在 2..MAX_TAG_FANOUT 頁共用時連線；共用頁數過多的標籤會把全圖連成樞紐，
+# 讓圖共現加分失去鑑別力（不變式 I-10）
+MAX_TAG_FANOUT = 16
+
+
+def category_from_path(md_path: Path, wiki_root: Path) -> str:
+    """由 wiki markdown 路徑推出知識種類：取所在資料夾名稱
+    （wiki/decisions/x.md → decisions）；位於 wiki 根目錄回傳 'root'。
+    圖引擎、向量庫、時間遞減、hook 都依這一個規則判定種類。"""
+    try:
+        rel = Path(md_path).relative_to(wiki_root)
+    except ValueError:
+        rel = Path(md_path)
+    return rel.parent.name if rel.parent.parts else "root"
+
 
 class WikiGraphEngine:
     def __init__(self, wiki_root: str):
@@ -20,15 +38,12 @@ class WikiGraphEngine:
         self.graph = nx.Graph()
         self.pages = {}
         self.tfidf_index = defaultdict(dict)
-        self.communities = {}
-        self.community_names = {}
         self._last_build = None
         self._file_mtimes = {}
 
     def build(self):
         self._scan_wiki_files()
         self._build_graph()
-        self._detect_communities()
         self._build_search_index()
         self._last_build = datetime.now()
         stats = self.get_stats()
@@ -37,7 +52,6 @@ class WikiGraphEngine:
             extra={
                 "total_pages": stats["total_pages"],
                 "total_edges": stats["total_edges"],
-                "communities": stats["communities"],
             },
         )
 
@@ -68,7 +82,6 @@ class WikiGraphEngine:
             except Exception as e:
                 logger.warning("skip markdown file", extra={"path": str(md_path), "error": str(e)})
         self._build_graph()
-        self._detect_communities()
         self._build_search_index()
         self._last_build = datetime.now()
         logger.info("graph incrementally rebuilt", extra={"changed_files": changed})
@@ -87,7 +100,7 @@ class WikiGraphEngine:
             'content': post.content,
             'metadata': dict(post.metadata),
             'path': str(md_path.relative_to(self.wiki_root.parent)),
-            'category': md_path.parent.name if md_path.parent != self.wiki_root else 'root',
+            'category': category_from_path(md_path, self.wiki_root),
         }
 
     def _scan_wiki_files(self):
@@ -135,32 +148,13 @@ class WikiGraphEngine:
                     tag_to_pages[tag].add(name)
 
         for tag, members in tag_to_pages.items():
-            if 2 <= len(members) <= 6:
+            if 2 <= len(members) <= MAX_TAG_FANOUT:
                 members_list = sorted(members)
                 for i, p1 in enumerate(members_list):
                     for p2 in members_list[i + 1:]:
                         if not self.graph.has_edge(p1, p2):
                             self.graph.add_edge(p1, p2,
                                                 confidence='INFERRED', source=f'tag:{tag}')
-
-    def _detect_communities(self):
-        if len(self.graph.nodes) < 3:
-            self.communities = {n: 0 for n in self.graph.nodes}
-            self.community_names = {0: '全體'}
-            return
-        try:
-            comms = nx.community.louvain_communities(self.graph, seed=42)
-            self.communities = {}
-            self.community_names = {}
-            for i, members in enumerate(comms):
-                for node in members:
-                    self.communities[node] = i
-                cats = Counter(self.pages[n]['category'] for n in members if n in self.pages)
-                top_cat = cats.most_common(1)[0][0] if cats else '?'
-                self.community_names[i] = f"{top_cat}-{i}"
-        except Exception as e:
-            logger.warning("community detection failed", extra={"error": str(e)})
-            self.communities = {n: 0 for n in self.graph.nodes}
 
     def _build_search_index(self):
         doc_terms = {}
@@ -227,50 +221,12 @@ class WikiGraphEngine:
         return {
             'name': name, 'content': match['content'], 'metadata': match['metadata'],
             'path': match['path'], 'category': match['category'],
-            'community': self.communities.get(name),
             'neighbors': list(self.graph.neighbors(name)) if name in self.graph else [],
         }
 
-    def get_related(self, concept: str, depth: int = 2) -> dict:
-        self.ensure_fresh()
-        if concept not in self.graph:
-            hits = [n for n in self.graph.nodes if concept.lower() in n.lower()]
-            if hits:
-                concept = hits[0]
-            else:
-                return {'error': f'找不到 "{concept}"',
-                        'available': sorted(self.graph.nodes)[:20]}
-
-        visited = {concept: 0}
-        queue = [(concept, 0)]
-        edges = []
-        while queue:
-            node, d = queue.pop(0)
-            if d >= depth:
-                continue
-            for nb in self.graph.neighbors(node):
-                ed = self.graph.edges[node, nb]
-                edges.append({'from': node, 'to': nb,
-                              'confidence': ed.get('confidence', ''),
-                              'source': ed.get('source', '')})
-                if nb not in visited:
-                    visited[nb] = d + 1
-                    queue.append((nb, d + 1))
-
-        nodes = [{'name': n, 'distance': d, 'category': self.pages.get(n, {}).get('category', ''),
-                  'community': self.communities.get(n)}
-                 for n, d in sorted(visited.items(), key=lambda x: x[1])]
-        return {'root': concept, 'depth': depth, 'nodes': nodes, 'edges': edges,
-                'node_count': len(nodes), 'edge_count': len(edges)}
-
-    def get_communities(self) -> list:
-        self.ensure_fresh()
-        buckets = defaultdict(list)
-        for node, cid in self.communities.items():
-            buckets[cid].append(node)
-        return [{'id': cid, 'name': self.community_names.get(cid, ''),
-                 'members': members, 'size': len(members)}
-                for cid, members in sorted(buckets.items())]
+    def neighbors(self, name: str) -> set:
+        """概念在圖上的 1-hop 鄰居名稱；供混合檢索的圖共現加分使用。"""
+        return set(self.graph.neighbors(name)) if name in self.graph else set()
 
     def get_stats(self) -> dict:
         conf = Counter(d.get('confidence', '?') for _, _, d in self.graph.edges(data=True))
@@ -278,12 +234,20 @@ class WikiGraphEngine:
             'total_pages': len(self.pages),
             'total_nodes': self.graph.number_of_nodes(),
             'total_edges': self.graph.number_of_edges(),
-            'communities': len(set(self.communities.values())) if self.communities else 0,
             'edge_confidences': dict(conf),
             'density': round(nx.density(self.graph), 4) if self.graph.number_of_nodes() > 1 else 0,
             'categories': dict(Counter(p['category'] for p in self.pages.values())),
             'last_build': self._last_build.isoformat() if self._last_build else None,
         }
+
+    def get_health_stats(self) -> dict:
+        """統計＋結構健康度（斷鏈、缺 frontmatter、孤立頁），REST 與 MCP 的 stats 共用。"""
+        s = self.get_stats()
+        d = self.get_diagnostics()
+        s.update({"broken_link_count": d["broken_count"],
+                  "no_frontmatter_count": d["no_frontmatter_count"],
+                  "orphan_count": d["orphan_count"]})
+        return s
 
     def get_diagnostics(self) -> dict:
         """擴充健康診斷（供 `mindgraph check` 用）：孤立頁面（degree 0、無連結）、
@@ -304,35 +268,6 @@ class WikiGraphEngine:
             "pages_without_frontmatter": no_meta,
             "no_frontmatter_count": len(no_meta),
         }
-
-    def get_god_nodes(self, limit: int = 5) -> list:
-        self.ensure_fresh()
-        return [{'name': n, 'degree': d, 'category': self.pages.get(n, {}).get('category', ''),
-                 'community': self.communities.get(n),
-                 'neighbors': list(self.graph.neighbors(n))}
-                for n, d in sorted(self.graph.degree(), key=lambda x: x[1], reverse=True)[:limit]]
-
-    def shortest_path(self, source: str, target: str) -> dict:
-        self.ensure_fresh()
-        for orig, name_ref in [(source, 'source'), (target, 'target')]:
-            if orig not in self.graph:
-                hits = [n for n in self.graph.nodes if orig.lower() in n.lower()]
-                if hits:
-                    if name_ref == 'source':
-                        source = hits[0]
-                    else:
-                        target = hits[0]
-        if source not in self.graph or target not in self.graph:
-            return {'error': '找不到起點或終點'}
-        try:
-            path = nx.shortest_path(self.graph, source, target)
-            edges = [{'from': path[i], 'to': path[i + 1],
-                      **self.graph.edges[path[i], path[i + 1]]}
-                     for i in range(len(path) - 1)]
-            return {'source': source, 'target': target, 'path': path,
-                    'length': len(path) - 1, 'edges': edges}
-        except nx.NetworkXNoPath:
-            return {'error': f'{source} 和 {target} 之間無路徑'}
 
     # === Section Navigation（Hierarchical Chunking）===
 

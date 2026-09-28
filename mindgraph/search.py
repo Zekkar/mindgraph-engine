@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 
+from mindgraph.recency import FAILURE_CATEGORIES
 from mindgraph.router import IntentRouter
 from mindgraph.retrievers import KeywordRetriever, two_stage_hybrid
 
@@ -27,7 +28,7 @@ INTENT_WEIGHTS: dict[str, dict[str, float]] = {
     "default": {"keyword": 0.4, "vector": 0.6},
 }
 
-DEFAULT_FAILURE_CATEGORIES: tuple[str, ...] = ("失敗模式", "failure-modes", "failures")
+DEFAULT_FAILURE_CATEGORIES: tuple[str, ...] = FAILURE_CATEGORIES
 FAILURE_BOOST = 1.5
 # substrings in a page NAME that hint the page is itself a failure/bug note
 _FAILURE_NAME_HINTS: tuple[str, ...] = ("fail", "error", "timeout", "bug", "失敗", "錯誤")
@@ -37,9 +38,10 @@ _FAILURE_NAME_HINTS: tuple[str, ...] = ("fail", "error", "timeout", "bug", "失�
 class SmartSearchService:
     """意圖感知混合檢索服務，協調圖/向量/意圖三路並支援 LLM 查詢擴展與降級保護。"""
 
-    graph_engine: object  # WikiGraphEngine：提供 KeywordRetriever 與 get_related 圖 boost
+    graph_engine: object  # WikiGraphEngine：提供 KeywordRetriever 與 neighbors 圖 boost
     vector_retriever: object | None = None  # VectorRetriever；None → 降級為關鍵字+圖
     llm_provider: object | None = None  # 供 IntentRouter Pass 2 擴展；None → 跳過
+    recency: object | None = None  # RecencyWeighter；None → 不做時間遞減
     router: IntentRouter = field(default_factory=IntentRouter)
     failure_categories: tuple[str, ...] = DEFAULT_FAILURE_CATEGORIES
     enable_expansion: bool = True
@@ -51,13 +53,9 @@ class SmartSearchService:
 
         intent = self.router.classify(query)
         weights = INTENT_WEIGHTS.get(intent.intent, INTENT_WEIGHTS["default"])
-        keyword_ret = KeywordRetriever(self.graph_engine)
         boost_fn = self._failure_boost_fn() if intent.intent == "failure" else None
 
-        result = two_stage_hybrid(
-            query, top_k, keyword_ret, self.vector_retriever, self.graph_engine,
-            weights=weights, boost_fn=boost_fn,
-        )
+        result = self._run(query, top_k, weights, boost_fn)
 
         top1 = result["results"][0]["score"] if result["results"] else 0.0
         if (
@@ -65,12 +63,25 @@ class SmartSearchService:
             and self.llm_provider is not None
             and self.router.needs_expansion(top1, query)
         ):
-            result = self._expand_and_merge(
-                query, top_k, keyword_ret, weights, result, boost_fn
-            )
+            result = self._expand_and_merge(query, top_k, weights, result, boost_fn)
 
         result["intent"] = {"type": intent.intent, "confidence": round(intent.confidence, 3)}
         return result
+
+    def hybrid(self, query: str, top_k: int = 10) -> dict:
+        """不做意圖路由的兩階段混合檢索（預設權重＋時間遞減＋圖共現），
+        供決策點 hook 預取使用；與 search() 共用同一組 retriever 與加權器（不變式 I-5）。"""
+        if hasattr(self.graph_engine, "ensure_fresh"):
+            self.graph_engine.ensure_fresh()
+        return self._run(query, top_k)
+
+    def _run(self, query: str, top_k: int, weights: dict | None = None, boost_fn=None) -> dict:
+        """所有檢索入口（search / hybrid / 擴展子查詢）唯一呼叫 two_stage_hybrid 的地方，
+        新增全域檢索參數只需改這裡（不變式 I-5）。"""
+        return two_stage_hybrid(
+            query, top_k, KeywordRetriever(self.graph_engine), self.vector_retriever,
+            self.graph_engine, weights=weights, boost_fn=boost_fn, recency=self.recency,
+        )
 
     def _failure_boost_fn(self):
         """產生 boost 函式：對 failure-mode 類頁面（類別 / 標籤 / 名稱命中）乘上 FAILURE_BOOST。"""
@@ -92,7 +103,7 @@ class SmartSearchService:
 
         return fn
 
-    def _expand_and_merge(self, query, top_k, keyword_ret, weights, base_result, boost_fn=None) -> dict:
+    def _expand_and_merge(self, query, top_k, weights, base_result, boost_fn=None) -> dict:
         """Pass 2：請 LLM 生成補充查詢，逐一檢索後與原結果合併取較高分。
 
         必須把同一個 boost_fn 傳給子查詢，否則經擴展才找到的（例如 failure-mode）頁面會以
@@ -107,10 +118,7 @@ class SmartSearchService:
         merged = {r["concept_name"]: r for r in base_result["results"]}
         for eq in extra_queries:
             try:
-                sub = two_stage_hybrid(
-                    eq, top_k, keyword_ret, self.vector_retriever, self.graph_engine,
-                    weights=weights, boost_fn=boost_fn,
-                )
+                sub = self._run(eq, top_k, weights, boost_fn)
             except Exception as e:  # 擴展查詢失敗不影響主結果
                 logger.warning("expansion sub-query failed: %s", e)
                 continue
@@ -144,6 +152,12 @@ def keyword_to_scored_dicts(raw: list[dict]) -> list[dict]:
     ]
 
 
+def degraded_keyword_result(engine, query: str, limit: int, reason: str) -> dict:
+    """沒有 SmartSearchService 時的降級回應（純關鍵字，形狀與混合檢索一致）；REST 與 MCP 共用。"""
+    return {"query": query, "results": keyword_to_scored_dicts(engine.search(query, limit)),
+            "degradation": reason}
+
+
 def build_smart_search(engine, cfg) -> SmartSearchService:
     """從 config 盡力組裝 SmartSearchService：金鑰/DB 缺失時自動降級（vector/LLM 設 None）。
 
@@ -170,4 +184,13 @@ def build_smart_search(engine, cfg) -> SmartSearchService:
     except Exception as e:
         logger.info("LLM provider unavailable, Pass 2 expansion disabled: %s", e)
 
-    return SmartSearchService(graph_engine=engine, vector_retriever=vector_ret, llm_provider=llm)
+    recency = None
+    if vector_ret is not None and getattr(cfg, "recency", None) and cfg.recency.enabled:
+        # 與 VectorRetriever 用同一個 model_version（writer-reader 共用常數，不變式 I-2）
+        from mindgraph.recency import make_db_weighter
+        recency = make_db_weighter(vector_ret.dsn, vector_ret.model_version, cfg.recency)
+
+    recall = getattr(cfg, "recall", None)
+    fail_cats = tuple(recall.failure_categories) if recall else DEFAULT_FAILURE_CATEGORIES
+    return SmartSearchService(graph_engine=engine, vector_retriever=vector_ret,
+                              llm_provider=llm, recency=recency, failure_categories=fail_cats)

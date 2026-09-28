@@ -11,6 +11,8 @@ import psycopg
 import frontmatter
 from pgvector.psycopg import register_vector
 
+from mindgraph.graph import category_from_path
+
 logger = logging.getLogger("mindgraph.store")
 
 _HEADING_RE = re.compile(r"^(#{2,4})\s+(.+?)\s*$")
@@ -43,9 +45,15 @@ def build_dsn(db) -> str:
 
 @dataclass(slots=True)
 class Section:
+    """wiki 概念頁的一個 H2–H4 章節（向量檢索的最小單位）。
+
+    category 是該頁所在的 wiki 資料夾名稱（＝知識種類），供時間遞減依種類決定衰減速度。
+    """
     concept_name: str
     section_id: str
     chunk_text: str
+    category: str | None = None
+    source_mtime: float | None = None  # 來源檔 mtime（epoch 秒），只用來補舊列的 content_changed_at
 
     @property
     def content_hash(self) -> str:
@@ -53,6 +61,8 @@ class Section:
 
 
 def iter_sections(wiki_root: Path) -> Iterator[Section]:
+    """逐頁把 wiki 切成 H2–H4 章節（無標題的頁整頁一塊，section_id='__page__'），
+    供 embed 增量寫入向量庫；跳過 index.md / log.md。"""
     for md_path in sorted(wiki_root.rglob("*.md")):
         if md_path.name in {"index.md", "log.md"}:
             continue
@@ -64,6 +74,8 @@ def iter_sections(wiki_root: Path) -> Iterator[Section]:
             continue
 
         concept_name = md_path.stem
+        category = category_from_path(md_path, wiki_root)
+        mtime = md_path.stat().st_mtime
         lines = content.split("\n")
         markers: list[tuple[int, int, str]] = []
         for i, line in enumerate(lines):
@@ -74,7 +86,7 @@ def iter_sections(wiki_root: Path) -> Iterator[Section]:
         if not markers:
             text = content.strip()
             if text:
-                yield Section(concept_name, "__page__", text)
+                yield Section(concept_name, "__page__", text, category, mtime)
             continue
 
         for idx, (lineno, level, heading_text) in enumerate(markers):
@@ -85,10 +97,18 @@ def iter_sections(wiki_root: Path) -> Iterator[Section]:
                     break
             chunk_text = "\n".join(lines[lineno:end]).strip()
             if chunk_text:
-                yield Section(concept_name, heading_text, chunk_text)
+                yield Section(concept_name, heading_text, chunk_text, category, mtime)
 
 
 class EmbeddingStore:
+    """wiki 章節向量庫（pgvector）的寫入端：供 `mindgraph embed` 增量同步 wiki/ 章節。
+
+    兩個時間欄位語意嚴格分開（不變式 I-1）：
+    - updated_at：存活標記，每次同步都刷新，只給 mark-and-sweep 清孤兒用
+    - content_changed_at：內容最後改變時間，只在 content_hash 真的變了才更新，給時間遞減算年齡
+    若混用成一個欄位，所有頁年齡永遠是 0 天，時間遞減會靜默失效而且不報錯。
+    """
+
     def __init__(self, dsn: str):
         self.dsn = dsn
         self.conn: psycopg.Connection | None = None
@@ -106,6 +126,7 @@ class EmbeddingStore:
             self.conn.close()
 
     def ensure_schema(self, dimension: int, model_version: str):
+        """建立（或就地升級）wiki.embeddings 與 wiki.eval_history；冪等，可重複執行。"""
         dimension = int(dimension)  # DDL cannot parameterize vector(dim); keep SQL int-only
         with self.conn.cursor() as cur:
             cur.execute("CREATE SCHEMA IF NOT EXISTS wiki")
@@ -119,12 +140,28 @@ class EmbeddingStore:
                     model_version TEXT NOT NULL,
                     embedding vector({dimension}),
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    content_changed_at TIMESTAMPTZ,
+                    category TEXT,
                     UNIQUE(concept_name, section_id, model_version)
+                )
+            """)
+            # v0.2.x 既有表就地升級
+            cur.execute("ALTER TABLE wiki.embeddings ADD COLUMN IF NOT EXISTS content_changed_at TIMESTAMPTZ")
+            cur.execute("ALTER TABLE wiki.embeddings ADD COLUMN IF NOT EXISTS category TEXT")
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS wiki.eval_history (
+                    eval_date DATE PRIMARY KEY,
+                    hit_rate DOUBLE PRECISION NOT NULL,
+                    total_q INTEGER NOT NULL,
+                    hits INTEGER NOT NULL,
+                    top_n INTEGER NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
                 )
             """)
         self.conn.commit()
 
     def get_existing_hash(self, concept: str, section_id: str, model: str) -> str | None:
+        """查某章節目前存的內容指紋；不存在回 None（代表要新增）。"""
         with self.conn.cursor() as cur:
             cur.execute(
                 "SELECT content_hash FROM wiki.embeddings "
@@ -134,33 +171,51 @@ class EmbeddingStore:
             row = cur.fetchone()
             return row[0] if row else None
 
-    def touch(self, concept: str, section_id: str, model: str, ingest_ts):
+    def touch(self, concept: str, section_id: str, model: str, ingest_ts,
+              category: str | None = None, changed_hint=None):
+        """內容未變的章節：只刷新存活標記 updated_at，順手補寫 category。
+
+        content_changed_at 刻意不動；唯一例外是它還是 NULL（v0.2 升級上來的舊列）時，
+        用 changed_hint（通常是檔案 mtime）補一次，讓舊資料也能參與時間遞減。
+        """
         with self.conn.cursor() as cur:
             cur.execute(
-                "UPDATE wiki.embeddings SET updated_at=%s "
+                "UPDATE wiki.embeddings SET updated_at=%s, "
+                "category=COALESCE(%s, category), "
+                "content_changed_at=COALESCE(content_changed_at, %s) "
                 "WHERE concept_name=%s AND section_id=%s AND model_version=%s",
-                (ingest_ts, concept, section_id, model),
+                (ingest_ts, category, changed_hint, concept, section_id, model),
             )
 
     def upsert(self, section: Section, embedding: list[float], model: str, ingest_ts):
+        """寫入新章節或更新已變動章節的向量；content_changed_at 只在指紋真的改變時更新。"""
         with self.conn.cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO wiki.embeddings
                   (concept_name, section_id, chunk_text, content_hash,
-                   model_version, embedding, updated_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                   model_version, embedding, updated_at, category, content_changed_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (concept_name, section_id, model_version) DO UPDATE
                 SET chunk_text   = EXCLUDED.chunk_text,
-                    content_hash = EXCLUDED.content_hash,
                     embedding    = EXCLUDED.embedding,
-                    updated_at   = EXCLUDED.updated_at
+                    updated_at   = EXCLUDED.updated_at,
+                    category     = EXCLUDED.category,
+                    content_changed_at = CASE
+                        WHEN wiki.embeddings.content_hash IS DISTINCT FROM EXCLUDED.content_hash
+                        THEN EXCLUDED.content_changed_at
+                        ELSE COALESCE(wiki.embeddings.content_changed_at,
+                                      EXCLUDED.content_changed_at)
+                    END,
+                    content_hash = EXCLUDED.content_hash
                 """,
                 (section.concept_name, section.section_id, section.chunk_text,
-                 section.content_hash, model, embedding, ingest_ts),
+                 section.content_hash, model, embedding, ingest_ts,
+                 section.category, ingest_ts),
             )
 
     def mark_sweep_orphans(self, model: str, ingest_ts) -> int:
+        """刪除本次同步沒刷新到存活標記的列（章節已不存在），回傳刪除筆數。"""
         with self.conn.cursor() as cur:
             cur.execute(
                 "DELETE FROM wiki.embeddings WHERE model_version=%s AND updated_at < %s",

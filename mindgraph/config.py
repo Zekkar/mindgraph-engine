@@ -3,6 +3,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 import yaml
 
+from mindgraph.recency import DEFAULT_BASE_LAMBDA, DEFAULT_FLOOR, FAILURE_CATEGORIES
+
 
 @dataclass
 class LLMConfig:
@@ -37,6 +39,36 @@ class ServerConfig:
 
 
 @dataclass
+class RecencyConfig:
+    """時間遞減設定：同主題較新的知識排前面。
+
+    category_ratio 的 key 是 wiki 資料夾名稱（＝知識種類），值是相對 base_lambda 的倍率；
+    逐 key 覆蓋內建預設（失敗模式/架構決策類不衰減）。evergreen 列出永不衰減的概念名。
+    """
+    enabled: bool = True
+    base_lambda: float = DEFAULT_BASE_LAMBDA
+    floor: float = DEFAULT_FLOOR
+    category_ratio: dict[str, float] | None = None
+    evergreen: list[str] = field(default_factory=list)
+
+
+@dataclass
+class RecallConfig:
+    """決策點主動召回（Claude Code hook）設定。
+
+    api_url 指向 `mindgraph serve` 的 REST 位址；failure_categories 是哪些 wiki 資料夾
+    算「失敗模式／教訓」頁——決策點只帶入這些頁，避免注入洗版（不變式 I-14）。
+    """
+    api_url: str = "http://127.0.0.1:8401"
+    failure_categories: list[str] = field(default_factory=lambda: list(FAILURE_CATEGORIES))
+    max_inject: int = 6
+    min_score: float = 0.55
+    decision_min_score: float = 0.5
+    gate_cooldown_s: int = 1800
+    timeout_s: float = 3.0
+
+
+@dataclass
 class AdapterConfig:
     type: str
     source: str = ""
@@ -54,6 +86,8 @@ class MindGraphConfig:
     server: ServerConfig = field(default_factory=ServerConfig)
     adapters: list[AdapterConfig] = field(default_factory=list)
     intent_patterns: dict[str, list[str]] = field(default_factory=dict)
+    recency: RecencyConfig = field(default_factory=RecencyConfig)
+    recall: RecallConfig = field(default_factory=RecallConfig)
 
     @classmethod
     def from_yaml(cls, path) -> "MindGraphConfig":
@@ -70,6 +104,12 @@ class MindGraphConfig:
         srv = ServerConfig(**{k: v for k, v in srv_data.items() if k in srv_fields}) if srv_data else ServerConfig()
 
         adapters = [AdapterConfig(**a) for a in data.get("adapters", [])]
+        rec_fields = set(RecencyConfig.__dataclass_fields__)
+        recency = RecencyConfig(**{k: v for k, v in (data.get("recency") or {}).items()
+                                   if k in rec_fields})
+        rc_fields = set(RecallConfig.__dataclass_fields__)
+        recall = RecallConfig(**{k: v for k, v in (data.get("recall") or {}).items()
+                                 if k in rc_fields})
 
         return cls(
             domain=data["domain"],
@@ -80,4 +120,6 @@ class MindGraphConfig:
             server=srv,
             adapters=adapters,
             intent_patterns=data.get("intent_patterns", {}),
+            recency=recency,
+            recall=recall,
         )

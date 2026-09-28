@@ -71,7 +71,10 @@ def embed(
                 section.concept_name, section.section_id, model_ver
             )
             if existing == section.content_hash:
-                store.touch(section.concept_name, section.section_id, model_ver, ingest_ts)
+                hint = (datetime.fromtimestamp(section.source_mtime, timezone.utc)
+                        if section.source_mtime else None)
+                store.touch(section.concept_name, section.section_id, model_ver, ingest_ts,
+                            category=section.category, changed_hint=hint)
                 skipped += 1
             else:
                 store.upsert(section, emb.embed(section.chunk_text), model_ver, ingest_ts)
@@ -173,128 +176,6 @@ def check(
 
 
 @app.command()
-def timeline(
-    concept: str = typer.Argument(...),
-    base_dir: str = typer.Option("."),
-    limit: int = typer.Option(50),
-):
-    """Show how a concept evolved over time across raw/ dated notes (devdiary, logs...)."""
-    import json
-    from mindgraph.timeline import concept_timeline
-
-    result = concept_timeline(Path(base_dir) / "raw", concept, limit=limit)
-    typer.echo(json.dumps(result, ensure_ascii=False, indent=2))
-
-
-@app.command()
-def coverage(
-    codebase: str = typer.Argument(..., help="Path to codebase root to scan"),
-    base_dir: str = typer.Option(".", help="MindGraph knowledge base root (contains wiki/)"),
-    min_mentions: int = typer.Option(1, help="Min wiki mentions to count as covered"),
-    exclude: str = typer.Option(
-        "__init__,test,conftest,migration,setup,manage",
-        help="Comma-separated stems to exclude",
-    ),
-    json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
-    service_level: bool = typer.Option(
-        False, "--service-level",
-        help="Scan top-level directories as service units instead of individual files",
-    ),
-):
-    """Measure how many codebase modules are covered by wiki knowledge.
-
-    Coverage = modules with at least --min-mentions wiki page references
-             / total modules scanned.
-
-    Example:
-        mindgraph coverage ./IBAPI/backend --base-dir .
-        mindgraph coverage ./ShioajiPy --service-level --base-dir .
-    """
-    import json as json_mod
-    import re
-
-    wiki_root = Path(base_dir) / "wiki"
-    code_root = Path(codebase)
-
-    if not code_root.exists():
-        typer.echo(f"ERROR: codebase path not found: {code_root}", err=True)
-        raise typer.Exit(1)
-    if not wiki_root.exists():
-        typer.echo(f"ERROR: wiki/ not found at {wiki_root}", err=True)
-        raise typer.Exit(1)
-
-    exclude_stems = {s.strip() for s in exclude.split(",")}
-
-    # ── Collect wiki text corpus ──
-    wiki_corpus = ""
-    for md in wiki_root.rglob("*.md"):
-        try:
-            wiki_corpus += md.read_text(encoding="utf-8", errors="ignore") + "\n"
-        except Exception:
-            pass
-
-    # ── Collect modules to scan ──
-    if service_level:
-        # Top-level directories as service units
-        modules = [
-            (d.name, d.name)
-            for d in sorted(code_root.iterdir())
-            if d.is_dir() and not d.name.startswith((".", "_", "__"))
-        ]
-    else:
-        # Individual .py files
-        modules = []
-        for py in sorted(code_root.rglob("*.py")):
-            if "__pycache__" in str(py) or "__pycache__" in py.parts:
-                continue
-            stem = py.stem
-            if stem in exclude_stems:
-                continue
-            rel = str(py.relative_to(code_root))
-            modules.append((stem, rel))
-
-    # ── Score each module ──
-    covered = []
-    uncovered = []
-    for stem, label in modules:
-        pattern = re.compile(re.escape(stem), re.IGNORECASE)
-        count = len(pattern.findall(wiki_corpus))
-        entry = {"module": label, "stem": stem, "mentions": count}
-        if count >= min_mentions:
-            covered.append(entry)
-        else:
-            uncovered.append(entry)
-
-    total = len(modules)
-    cov_pct = round(len(covered) / total * 100, 1) if total else 0.0
-
-    result = {
-        "codebase": str(code_root),
-        "wiki": str(wiki_root),
-        "total_modules": total,
-        "covered": len(covered),
-        "uncovered": len(uncovered),
-        "coverage_pct": cov_pct,
-        "min_mentions": min_mentions,
-        "uncovered_modules": [u["module"] for u in uncovered],
-        "covered_modules": [c["module"] for c in covered],
-    }
-
-    if json_output:
-        typer.echo(json_mod.dumps(result, ensure_ascii=False, indent=2))
-    else:
-        typer.echo(f"Coverage: {len(covered)}/{total} ({cov_pct}%)")
-        typer.echo(f"Wiki: {wiki_root}")
-        typer.echo(f"Codebase: {code_root}")
-        if uncovered:
-            typer.echo(f"\nUncovered ({len(uncovered)}):")
-            for u in sorted(uncovered, key=lambda x: x["module"]):
-                typer.echo(f"  ✗ {u['module']}")
-        else:
-            typer.echo("\nAll modules covered!")
-
-
-@app.command()
 def serve(
     config: str = typer.Option("mindgraph.yml"),
     base_dir: str = typer.Option("."),
@@ -336,6 +217,189 @@ def mcp(
 
     server = build_mcp(base_dir=base_dir, config_path=config)
     server.run(transport="stdio")
+
+
+@app.command("eval")
+def evaluate_cmd(
+    config: str = typer.Option("mindgraph.yml"),
+    base_dir: str = typer.Option("."),
+    sample: int = typer.Option(20, help="Number of wiki concepts to sample"),
+    top_n: int = typer.Option(3, help="A hit = target concept ranked within top N"),
+    seed: int = typer.Option(None, help="Random seed for a reproducible sample"),
+    save: bool = typer.Option(False, "--save", help="Write the result to wiki.eval_history"),
+):
+    """Measure retrieval hit rate: can each sampled concept be found by asking what it is?
+
+    Rank-based (not score-threshold) so recency's score rescaling can't fake a regression.
+    """
+    import json
+    from mindgraph.server import build_runtime
+    from mindgraph.evaluate import evaluate_hit_rate, save_hit_rate
+    from mindgraph.store import build_dsn
+
+    cfg, engine, svc = build_runtime(base_dir, config)
+    concepts = sorted(n for n in engine.pages if n not in {"index", "log"})
+    result = evaluate_hit_rate(svc, concepts, sample=sample, top_n=top_n, seed=seed)
+    result["vector_enabled"] = svc.vector_retriever is not None
+    result["recency_enabled"] = svc.recency is not None
+    typer.echo(json.dumps(result, ensure_ascii=False, indent=2))
+    if save:
+        save_hit_rate(build_dsn(cfg.database), result)
+        typer.echo("saved to wiki.eval_history")
+
+
+# ─── 程式碼圖 ────────────────────────────────────────────────────────────────
+code_app = typer.Typer(help="Code graph: index a Python repo and link symbols to wiki concepts")
+app.add_typer(code_app, name="code")
+
+
+def _code_conn(config: str):
+    """code 子指令共用：讀設定並開一條到程式碼圖資料庫的連線，回傳 (cfg, conn)。"""
+    import psycopg
+    from mindgraph.config import MindGraphConfig
+    from mindgraph.store import build_dsn
+
+    cfg = MindGraphConfig.from_yaml(config)
+    return cfg, psycopg.connect(build_dsn(cfg.database))
+
+
+@code_app.command("sync")
+def code_sync(
+    repo_path: str = typer.Argument(..., help="Path to the Python repository"),
+    repo: str = typer.Option(None, help="Repo name (default: directory name)"),
+    config: str = typer.Option("mindgraph.yml"),
+    exclude: list[str] = typer.Option([], "--exclude", help="Extra fnmatch patterns to skip"),
+    methods: str = typer.Option("all", help="all | name_only | embedding_only"),
+):
+    """Index the repo, then rebuild code↔wiki links — always both, in this order.
+
+    Re-indexing regenerates symbol ids and drops existing links, so linking is never optional.
+    Run `mindgraph embed` first so links see the current wiki.
+    """
+    import json
+    from mindgraph.code import index_repository, link_wiki
+    from mindgraph.store import build_dsn, model_version
+
+    cfg, conn = _code_conn(config)
+    name = repo or Path(repo_path).resolve().name
+    provider = mv = recency_fn = None
+    if methods != "name_only":
+        from mindgraph.providers import get_embedding_provider
+        provider = get_embedding_provider(cfg)
+        mv = model_version(cfg.embedding.provider, cfg.embedding.model, provider.dimension)
+        if cfg.recency.enabled:
+            from mindgraph.recency import make_db_weighter
+            recency_fn = make_db_weighter(build_dsn(cfg.database), mv, cfg.recency).factor_for
+    with conn:
+        idx = index_repository(conn, repo_path, name, exclude=exclude)
+        links = link_wiki(conn, name, embedding_provider=provider, model_version=mv,
+                          methods=methods, recency_fn=recency_fn)
+    typer.echo(json.dumps({"index": idx, "links": links}, ensure_ascii=False, indent=2, default=str))
+    cleared_emb = (links.get("cleared_links") or {}).get("embedding_match", 0)
+    if methods == "name_only" and cleared_emb:
+        typer.echo(f"WARNING: name_only cleared {cleared_emb} embedding_match links", err=True)
+
+
+@code_app.command("status")
+def code_status(
+    repo: str = typer.Argument(...),
+    config: str = typer.Option("mindgraph.yml"),
+):
+    """Show index freshness: indexed git HEAD vs current HEAD (stale index = silent gap)."""
+    import json
+    from mindgraph.code import index_status
+
+    _cfg, conn = _code_conn(config)
+    with conn:
+        st = index_status(conn, repo)
+    typer.echo(json.dumps(st, ensure_ascii=False, indent=2, default=str))
+    if st.get("stale"):
+        raise typer.Exit(1)
+
+
+@code_app.command("coverage")
+def code_coverage(
+    repo: str = typer.Argument(...),
+    config: str = typer.Option("mindgraph.yml"),
+    exclude: list[str] = typer.Option([], "--exclude", help="Path patterns to drop from both sides"),
+):
+    """Semantic coverage: share of public functions/methods with an embedding_match wiki link."""
+    import json
+    from mindgraph.code import coverage
+
+    _cfg, conn = _code_conn(config)
+    with conn:
+        typer.echo(json.dumps(coverage(conn, repo, exclude_paths=exclude),
+                              ensure_ascii=False, indent=2, default=str))
+
+
+@code_app.command("search")
+def code_search_cmd(
+    query: str = typer.Argument(...),
+    repo: str = typer.Option(None),
+    limit: int = typer.Option(20),
+    config: str = typer.Option("mindgraph.yml"),
+):
+    """Fuzzy-search code symbols with their linked wiki concepts."""
+    import json
+    from mindgraph.config import MindGraphConfig
+    from mindgraph.server.code_routes import code_search_payload
+    from mindgraph.store import build_dsn
+
+    cfg = MindGraphConfig.from_yaml(config)
+    typer.echo(json.dumps(code_search_payload(build_dsn(cfg.database), query, repo, limit),
+                          ensure_ascii=False, indent=2, default=str))
+
+
+# ─── Claude Code hooks ───────────────────────────────────────────────────────
+hook_app = typer.Typer(help="Claude Code hook entry points (read hook JSON on stdin)")
+app.add_typer(hook_app, name="hook")
+
+
+def _run_hook(config: str, handler: str) -> None:
+    """共用 hook 外殼：讀 stdin JSON → 呼叫 RecallClient → 印出結果；任何例外都靜默放行。"""
+    import json
+    import sys
+    try:
+        from mindgraph.recall import RecallClient, is_decision_command
+        payload = json.loads(sys.stdin.buffer.read().decode("utf-8", errors="replace"))
+        # 快速放行：絕大多數 Bash 呼叫不是決策點，不必載入設定檔
+        if handler != "prefetch" and payload.get("tool_name") == "Bash" and not is_decision_command(
+                str((payload.get("tool_input") or {}).get("command", ""))):
+            return
+        from mindgraph.config import MindGraphConfig, RecallConfig
+        try:
+            rc = MindGraphConfig.from_yaml(config).recall
+        except Exception:
+            rc = RecallConfig()  # 沒有設定檔也能用預設值運作
+        client = RecallClient(rc)
+        if handler == "prefetch":
+            out = client.prefetch(payload)
+        else:
+            event, tool = payload.get("hook_event_name"), payload.get("tool_name")
+            if event == "PostToolUse" and tool in ("Edit", "Write"):
+                out = client.on_edit(payload)
+            elif event == "PreToolUse" and tool == "Bash":
+                out = client.on_bash(payload)
+            else:
+                out = None
+        if out:
+            sys.stdout.reconfigure(encoding="utf-8")
+            sys.stdout.write(out if isinstance(out, str) else json.dumps(out, ensure_ascii=False))
+    except Exception:
+        pass
+
+
+@hook_app.command("prefetch")
+def hook_prefetch(config: str = typer.Option("mindgraph.yml")):
+    """UserPromptSubmit: inject related wiki pages as <wiki-context>."""
+    _run_hook(config, "prefetch")
+
+
+@hook_app.command("decision-point")
+def hook_decision_point(config: str = typer.Option("mindgraph.yml")):
+    """PostToolUse(Edit|Write) / PreToolUse(Bash): recall related failure modes at decision points."""
+    _run_hook(config, "decision-point")
 
 
 if __name__ == "__main__":

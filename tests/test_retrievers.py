@@ -10,11 +10,21 @@ class _FakeEngine:
     def search(self, q, k):
         return self._r
 
-    def get_related(self, name, depth=1):
-        return {"nodes": []}
+    def neighbors(self, name):
+        return getattr(self, "adj", {}).get(name, set())
 
 
 KW_ONLY = {"keyword": 1.0, "vector": 0.0}
+
+
+def test_graph_boost_needs_a_real_cooccurring_neighbour():
+    eng = _FakeEngine([{"name": n, "score": 1.0, "snippet": ""} for n in ("hub", "a", "lone")])
+    eng.adj = {"hub": {"a"}, "lone": {"elsewhere"}}
+    out = two_stage_hybrid("q", 3, KeywordRetriever(eng), None, eng, weights=KW_ONLY)
+    by = {r["concept_name"]: r for r in out["results"]}
+    assert by["hub"]["retriever_breakdown"].get("graph_boost") == 0.1  # 1 個真鄰居就加分
+    assert "graph_boost" not in by["lone"]["retriever_breakdown"]  # 鄰居不在候選內
+    assert "hub" not in by["hub"]["retriever_breakdown"]["cooccur_neighbors"]  # 不把自己算進去
 
 
 def test_keyword_normalization():

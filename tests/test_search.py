@@ -113,6 +113,36 @@ def test_build_smart_search_degrades_without_keys(engine, monkeypatch):
     assert svc.llm_provider is None
 
 
+def test_build_smart_search_wires_recency_with_same_model_version(engine, monkeypatch):
+    """守接線（不只守邏輯）：有向量庫時 build_smart_search 必須建出 recency，
+    且 recency 讀的 model_version 與 VectorRetriever 相同（I-2 / I-5）。"""
+    from unittest import mock
+    from mindgraph import recency as rec_mod
+    from mindgraph.search import build_smart_search
+    from mindgraph.config import MindGraphConfig, LLMConfig, EmbeddingConfig, RecencyConfig
+
+    fake_emb = mock.MagicMock(dimension=768)
+    monkeypatch.setattr("mindgraph.providers.get_embedding_provider", lambda c: fake_emb)
+    seen = {}
+
+    def fake_make(dsn, mv, cfg=None):
+        seen["mv"] = mv
+        return rec_mod.RecencyWeighter(lambda: {})
+
+    monkeypatch.setattr(rec_mod, "make_db_weighter", fake_make)
+    cfg = MindGraphConfig(
+        domain="t",
+        llm=LLMConfig("openai", "gpt-4o-mini", "NO_SUCH_KEY_ENV"),
+        embedding=EmbeddingConfig("gemini", "gemini-embedding-001", "X"),
+    )
+    svc = build_smart_search(engine, cfg)
+    assert svc.recency is not None
+    assert seen["mv"] == svc.vector_retriever.model_version == "gemini-gemini-embedding-001-d768"
+
+    cfg.recency = RecencyConfig(enabled=False)
+    assert build_smart_search(engine, cfg).recency is None
+
+
 def test_keyword_to_scored_dicts_shape():
     from mindgraph.search import keyword_to_scored_dicts
     out = keyword_to_scored_dicts([{"name": "a", "snippet": "s", "score": 0.5}])

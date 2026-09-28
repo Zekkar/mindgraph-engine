@@ -29,3 +29,20 @@ adapters:
   - type: filesystem
     source: ./raw/notes
     target: raw/notes
+
+# Recency: newer knowledge ranks first within a topic (keys = wiki folder names)
+recency:
+  enabled: true
+  base_lambda: 0.003
+  floor: 0.5
+  category_ratio:
+    failure-modes: 0
+    decisions: 0
+  evergreen: []
+
+# Decision-point recall for Claude Code hooks (`mindgraph hook ...`)
+recall:
+  api_url: http://127.0.0.1:8401
+  failure_categories: [failure-modes]
+  max_inject: 6
+  min_score: 0.55

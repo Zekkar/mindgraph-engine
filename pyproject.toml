@@ -4,14 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mindgraph-engine"
-version = "0.2.1"
+version = "0.3.0"
 description = "LLM-powered knowledge graph with hybrid RAG and MCP server"
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.111",
     "uvicorn[standard]>=0.29",
     "networkx>=3.2",
-    "python-louvain>=0.16",
     "python-frontmatter>=1.1",
     "pyyaml>=6.0",
     "typer>=0.12",
@@ -20,7 +19,7 @@ dependencies = [
     "google-genai>=1.0",
     "openai>=1.30",
     "anthropic>=0.40",
-    "mcp>=1.0",
+    "mcp>=1.0,<2",
 ]
 
 [project.scripts]

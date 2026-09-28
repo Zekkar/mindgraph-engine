@@ -66,11 +66,33 @@ def test_concept_found_and_404(client):
     assert client.get("/api/concept/does-not-exist").status_code == 404
 
 
-def test_related(client):
-    r = client.get("/api/related/alpha", params={"depth": 1})
+def test_hybrid_search_shares_smart_service(tmp_path):
+    wiki = _make_wiki(tmp_path)
+    (wiki / "failure-modes").mkdir()
+    (wiki / "failure-modes" / "gamma.md").write_text(
+        "---\ntags: [misc]\n---\n# Gamma\n\nUnrelated gamma note.\n", encoding="utf-8")
+    engine = WikiGraphEngine(str(wiki))
+    engine.build()
+    smart = SmartSearchService(graph_engine=engine)
+    c = TestClient(create_app(engine, smart))
+    r = c.get("/api/hybrid_search", params={"q": "gamma", "top_k": 3})
     assert r.status_code == 200
-    names = [n["name"] for n in r.json()["nodes"]]
-    assert "beta" in names  # EXTRACTED edge via related: [beta]
+    body = r.json()
+    assert "intent" not in body  # 不做意圖路由
+    top = body["results"][0]
+    assert top["concept_name"] == "gamma"
+    assert top["category"] == "failure-modes"  # hook 依 category 挑失敗模式頁
+
+
+def test_removed_endpoints_are_gone(client):
+    for path in ("/api/related/alpha", "/api/communities", "/api/god-nodes",
+                 "/api/timeline/alpha"):
+        assert client.get(path).status_code == 404, path
+
+
+def test_stats_reports_structural_health(client):
+    body = client.get("/api/stats").json()
+    assert {"broken_link_count", "no_frontmatter_count"} <= set(body)
 
 
 def test_smart_search_degrades_without_service(tmp_path):
@@ -90,5 +112,4 @@ def test_mcp_registers_expected_tools(tmp_path):
     server = create_mcp(engine)
     tools = asyncio.run(server.list_tools())
     names = {t.name for t in tools}
-    assert {"search", "smart_search", "get_concept", "related",
-            "communities", "stats", "god_nodes"} <= names
+    assert names == {"search", "get_concept", "list_sections", "get_section", "stats"}
